@@ -75,7 +75,11 @@ class FileCache(object):
         ds = self._get_flow_datastore(ds_type, ds_root, flow_name)
 
         task_ds = ds.get_task_datastore(
-            run_id, step_name, task_id, data_metadata={"objects": {}, "info": {}}
+            run_id,
+            step_name,
+            task_id,
+            data_metadata={"objects": {}, "info": {}},
+            allow_not_done=True,
         )
         return task_ds.load_logs(LOG_SOURCES, stream, attempt_override=attempt)
 
@@ -104,7 +108,11 @@ class FileCache(object):
         ds = self._get_flow_datastore(ds_type, ds_root, flow_name)
 
         task_ds = ds.get_task_datastore(
-            run_id, step_name, task_id, data_metadata={"objects": {}, "info": {}}
+            run_id,
+            step_name,
+            task_id,
+            data_metadata={"objects": {}, "info": {}},
+            allow_not_done=True,
         )
 
         log = task_ds.load_log_legacy(logtype, attempt_override=attempt)
@@ -125,6 +133,7 @@ class FileCache(object):
             task_id,
             attempt=attempt,
             data_metadata={"objects": {}, "info": {}},
+            allow_not_done=True,
         )
 
         return task_ds.get_legacy_log_size(logtype)
@@ -142,6 +151,7 @@ class FileCache(object):
             task_id,
             attempt=attempt,
             data_metadata={"objects": {}, "info": {}},
+            allow_not_done=True,
         )
 
         return task_ds.get_log_size(LOG_SOURCES, logtype)

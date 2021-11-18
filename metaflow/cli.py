@@ -345,7 +345,7 @@ def logs(obj, input_path, stdout=None, stderr=None, both=None, timestamps=False)
                 step_name=step_name,
                 task_id=task_id,
                 mode="r",
-                allow_unsuccessful=True,
+                allow_not_done=True,
             )
         ]
     else:
