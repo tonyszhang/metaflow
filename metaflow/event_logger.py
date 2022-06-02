@@ -1,33 +1,31 @@
-from .sidecar import SidecarSubProcess
-from .sidecar_messages import Message, MessageTypes
+from metaflow.sidecar import Message, MessageTypes, Sidecar
 
 
-class NullEventLogger(object):
-    def __init__(self, *args, **kwargs):
-        pass
+class BaseEventLogger(object):
+    TYPE = "nullSidecarLogger"
+
+    def __init__(self, flow=None, env=None):
+        self._sidecar = Sidecar(self.TYPE)
 
     def start(self):
+        return self._sidecar.start()
+
+    def terminate(self):
+        return self._sidecar.terminate()
+
+    def add_to_context(self, **kwargs):
         pass
 
     def log(self, payload):
-        pass
+        if self._sidecar.is_active:
+            msg = Message(MessageTypes.BEST_EFFORT, payload)
+            self._sidecar.send(msg)
 
-    def terminate(self):
-        pass
+    @classmethod
+    def get_worker(cls):
+        return None
 
 
-class EventLogger(NullEventLogger):
-    def __init__(self, logger_type):
-        # type: (str) -> None
-        self.sidecar_process = None
-        self.logger_type = logger_type
-
-    def start(self):
-        self.sidecar_process = SidecarSubProcess(self.logger_type)
-
-    def log(self, payload):
-        msg = Message(MessageTypes.LOG_EVENT, payload)
-        self.sidecar_process.msg_handler(msg)
-
-    def terminate(self):
-        self.sidecar_process.kill()
+# Backward compatible name
+class EventLogger(BaseEventLogger):
+    pass
