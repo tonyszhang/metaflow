@@ -25,6 +25,7 @@ from metaflow.parameters import deploy_time_eval
 from metaflow.util import compress_list, dict_to_cli_options, to_camelcase
 
 from .argo_client import ArgoClient
+from .argo_events import ArgoEvents
 
 
 class ArgoWorkflowsException(MetaflowException):
@@ -114,7 +115,6 @@ class ArgoWorkflows(object):
 
         self.parameters = self._process_parameters()
         self._workflow_template = self._compile()
-        self._cron = self._cron()
 
     def __str__(self):
         return str(self._workflow_template)
@@ -161,26 +161,44 @@ class ArgoWorkflows(object):
     def _cron(self):
         schedule = self.flow._flow_decorators.get("schedule")
         if schedule:
-            # Remove the field "Year" if it exists
+            # Remove the field "Year" if it exists.
+            # TODO: Lift `@schedule` decorator to top-level
             return " ".join(schedule.schedule.split()[:5])
         return None
 
-    def schedule(self):
+    def schedule(self, ignore_triggers):
+        trigger_explanation = (
+            "No triggers defined. You need to launch this workflow manually."
+        )
+        # Set up Cron WorkflowTemplate (or delete one if no cron schedule defined).
+        cron = self._cron()
         try:
             ArgoClient(namespace=KUBERNETES_NAMESPACE).schedule_workflow_template(
-                self.name, self._cron
+                self.name, cron
             )
+            if cron:
+                trigger_explanation = (
+                    "This workflow triggers automatically via the CronWorkflow *%s*."
+                    % self.name
+                )
         except Exception as e:
             raise ArgoWorkflowsSchedulingException(str(e))
 
-    def trigger_explanation(self):
-        if self._cron:
-            return (
-                "This workflow triggers automatically via the CronWorkflow *%s*."
-                % self.name
-            )
-        else:
-            return "No triggers defined. You need to launch this workflow manually."
+        # Set up Argo Events Trigger (or delete one if no trigger defined).
+        if not ignore_triggers:
+            sensor = ArgoEvents(
+                self.name, self.flow, self.username, self.production_token
+            ).sensor()
+            try:
+                print(sensor)
+                ArgoClient(namespace=KUBERNETES_NAMESPACE).register_sensor(
+                    self.name, sensor.to_json()
+                )
+                if sensor:
+                    trigger_explanation = "foo"
+            except Exception as e:
+                raise ArgoWorkflowsSchedulingException(str(e))
+        return trigger_explanation
 
     @classmethod
     def get_existing_deployment(cls, name):

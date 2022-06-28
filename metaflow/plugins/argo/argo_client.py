@@ -203,3 +203,60 @@ class ArgoClient(object):
             raise ArgoClientException(
                 json.loads(e.body)["message"] if e.body is not None else e.reason
             )
+
+    def register_sensor(self, name, sensor):
+        # Unfortunately, Kubernetes client does not handle optimistic
+        # concurrency control by itself unlike kubectl
+        try:
+            sensor["metadata"][
+                "resourceVersion"
+            ] = self._client.CustomObjectsApi().get_namespaced_custom_object(
+                group=self._group,
+                version=self._version,
+                namespace=self._namespace,
+                plural="sensors",
+                name=name,
+            )[
+                "metadata"
+            ][
+                "resourceVersion"
+            ]
+        except self._client.rest.ApiException as e:
+            # Sensor does not exist and we want to create one
+            if e.status == 404:
+                if sensor is None:
+                    return
+                try:
+                    return (
+                        self._client.CustomObjectsApi().create_namespaced_custom_object(
+                            group=self._group,
+                            version=self._version,
+                            namespace=self._namespace,
+                            plural="sensors",
+                            body=sensor,
+                        )
+                    )
+                except self._client.rest.ApiException as e:
+                    raise ArgoClientException(
+                        json.loads(e.body)["message"]
+                        if e.body is not None
+                        else e.reason
+                    )
+            else:
+                raise ArgoClientException(
+                    json.loads(e.body)["message"] if e.body is not None else e.reason
+                )
+        # TODO: Figure out a way to disable sensor
+        try:
+            return self._client.CustomObjectsApi().replace_namespaced_custom_object(
+                group=self._group,
+                version=self._version,
+                namespace=self._namespace,
+                plural="sensors",
+                body=sensor,
+                name=name,
+            )
+        except self._client.rest.ApiException as e:
+            raise ArgoClientException(
+                json.loads(e.body)["message"] if e.body is not None else e.reason
+            )

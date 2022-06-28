@@ -127,6 +127,12 @@ def argo_workflows(obj, name=None):
     "are processed first if Argo Workflows controller is configured to process limited "
     "number of workflows in parallel",
 )
+@click.option(
+    "--ignore-triggers",
+    is_flag=True,
+    default=False,
+    help="Ignore the @trigger decorator applied for this flow.",
+)
 @click.pass_obj
 def create(
     obj,
@@ -139,6 +145,7 @@ def create(
     max_workers=None,
     workflow_timeout=None,
     workflow_priority=None,
+    ignore_triggers=False,
 ):
     validate_tags(tags)
 
@@ -189,9 +196,10 @@ def create(
                 "due to Kubernetes naming conventions\non Argo Workflows. The "
                 "original flow name is stored in the workflow annotation.\n"
             )
-        flow.schedule()
+        schedule = flow.schedule(ignore_triggers)
+        # TODO: Add --ignore-schedule option
         obj.echo("What will trigger execution of the workflow:", bold=True)
-        obj.echo(flow.trigger_explanation(), indent=True)
+        obj.echo(schedule, indent=True)
 
         # response = ArgoWorkflows.trigger(obj.workflow_name)
         # run_id = "argo-" + response["metadata"]["name"]
@@ -322,7 +330,14 @@ def resolve_workflow_name(obj, name):
 
 
 def make_flow(
-    obj, token, name, tags, namespace, max_workers, workflow_timeout, workflow_priority
+    obj,
+    token,
+    name,
+    tags,
+    namespace,
+    max_workers,
+    workflow_timeout,
+    workflow_priority,
 ):
     # TODO: Make this check less specific to Amazon S3 as we introduce
     #       support for more cloud object stores.
