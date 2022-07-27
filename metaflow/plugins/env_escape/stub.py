@@ -3,6 +3,7 @@ import pickle
 
 from .consts import (
     OP_GETATTR,
+    OP_GETATTRONCLASS,
     OP_SETATTR,
     OP_DELATTR,
     OP_CALL,
@@ -15,6 +16,7 @@ from .consts import (
     OP_PICKLE,
     OP_DIR,
     OP_INIT,
+    OP_NEW,
 )
 
 DELETED_ATTRS = frozenset(["__array_struct__", "__array_interface__"])
@@ -27,7 +29,8 @@ LOCAL_ATTRS = (
             "___identifier___",
             "___connection___",
             "___refcount___",
-            "___local_overrides___" "__class__",
+            "___local_overrides___",
+            "__class__",
             "__init__",
             "__del__",
             "__delattr__",
@@ -75,6 +78,11 @@ class StubMetaClass(type):
         else:
             return "<stub class '%s'>" % (self.__name__,)
 
+    def __getattr__(cls, name):
+        return cls.___class_connection___.stub_request(
+            None, OP_GETATTRONCLASS, cls.___class_remote_class_name___, name
+        )
+
 
 def with_metaclass(meta, *bases):
     """Create a base class with a metaclass."""
@@ -105,18 +113,65 @@ class Stub(with_metaclass(StubMetaClass, object)):
     # def __iter__(self):  # FIXME: Keep debugger QUIET!!
     #    raise AttributeError
 
-    def __init__(self, connection, remote_class_name, identifier):
-        self.___remote_class_name___ = remote_class_name
-        self.___identifier___ = identifier
-        self.___connection___ = connection
-        self.___refcount___ = 1
+    def __new__(cls, *args, **kwargs):
+        # There are two ways a stub is initialized (Foo for example) is initialized:
+        #  - when it is returned from the remote side, in which case we do
+        #    Foo(connection, remote_class_name, identifier)
+        #  - when it is created locally and needs to actually forward to __init__ on
+        #    the remote side. In this case, we want the user to be able to do
+        #    Foo(*args, **kwargs) (whatever the usual arguments to __init__ are)
+        #
+        if len(args) == 3 and id(args[0]) == id(cls.___class_connection___):
+            # We don't do anything specific here -- we will handle things in __init__
+            # print("In NEW with identifier")
+            return super().__new__(cls)
+        else:
+            # Otherwise, we forward to the remote side. This will create an instance
+            # when it comes back from the remote side which we return here. The instance
+            # will have been initialized as a proxy on this side (so we would have
+            # called __init__ here already but we will forward an OP_INIT call later in
+            # case this is actually a base class and __init__ needs to be called later.
+            # print(
+            #     "In NEW with %s AND %s for cls %s, mro: %s"
+            #     % (
+            #         ",".join([str(x) for x in args]),
+            #         ",".join(["%s:%s" % (str(k), str(v)) for k, v in kwargs.items()]),
+            #         str(cls),
+            #         str(cls.__mro__),
+            #     )
+            # )
+            v = cls.___class_connection___.stub_request(
+                None, OP_NEW, cls.___class_remote_class_name___, *args, **kwargs
+            )
+            # print("Done with new, return type is %s" % type(v))
+            return v
+
+    def __init__(self, *args, **kwargs):
+        # This works in coordination with the __new__ function above:
+        #   - If we did Foo(connection, remote_class_name, identifier), we actually set
+        #     these values here
+        #   - If not, we did a remote init which already returned the object fully
+        #     baked so we do nothing.
+
+        def proxy_init(connection, remote_class_name, identifier):
+            self.___remote_class_name___ = remote_class_name
+            self.___identifier___ = identifier
+            self.___connection___ = connection
+            self.___refcount___ = 1
+
+        if len(args) == 3 and id(args[0]) == id(self.__class__.___class_connection___):
+            # This should be connection, remote_class_name and identifier
+            # print("Proxy init")
+            proxy_init(*args)
+        else:
+            # print("regular init")
+            fwd_request(self, OP_INIT, *args, **kwargs)
 
     def __del__(self):
         try:
-            pass
             self.___refcount___ -= 1
             if self.___refcount___ == 0:
-                fwd_request(self, OP_DEL)
+                fwd_request(self, OP_DEL, self.___identifier___)
         except Exception:
             # raised in a destructor, most likely on program termination,
             # when the connection might have already been closed.
@@ -125,9 +180,7 @@ class Stub(with_metaclass(StubMetaClass, object)):
 
     def __getattribute__(self, name):
         if name in LOCAL_ATTRS:
-            if name == "__class__":
-                return None
-            elif name == "__doc__":
+            if name == "__doc__":
                 return self.__getattr__("__doc__")
             elif name in DELETED_ATTRS:
                 raise AttributeError()
@@ -220,40 +273,6 @@ def _make_method(method_type, connection, class_name, name, doc):
         return m
 
 
-class MetaWithConnection(StubMetaClass):
-    # The use of this metaclass is so that we can support two modes when
-    # instantiating a sub-class of Stub. Suppose we have a class Foo which is a stub.
-    # There are two ways Foo is initialized:
-    #  - when it is returned from the remote side, in which case we do
-    #    Foo(class_name, connection, identifier)
-    #  - when it is created locally and needs to actually forward to __init__ on
-    #    the remote side. In this case, we want the user to be able to do
-    #    Foo(*args, **kwargs) (whatever the usual arguments to __init__ are)
-    #
-    # With this metaclass, we do just that. We introspect arguments and look to
-    # see if the first one is the connection which would indicate that we are in
-    # the first case. If that is the case, we just pass everything down to the
-    # super __call__ and go our merry way. If this is not the case, we will
-    # use the connection we saved when creating this meta class and call
-    # OP_INIT to create the object
-
-    def __new__(cls, class_name, base_classes, class_dict, connection):
-        return type.__new__(cls, class_name, base_classes, class_dict)
-
-    def __init__(cls, class_name, base_classes, class_dict, connection):
-        cls.___class_remote_class_name___ = class_name
-        cls.___class_connection___ = connection
-        super(MetaWithConnection, cls).__init__(class_name, base_classes, class_dict)
-
-    def __call__(cls, *args, **kwargs):
-        if len(args) > 0 and id(args[0]) == id(cls.___class_connection___):
-            return super(MetaWithConnection, cls).__call__(*args, **kwargs)
-        else:
-            return cls.___class_connection___.stub_request(
-                None, OP_INIT, cls.___class_remote_class_name___, *args, **kwargs
-            )
-
-
 def create_class(
     connection,
     class_name,
@@ -325,4 +344,6 @@ def create_class(
             overriden_attrs.add(attr)
         class_dict[attr] = property(getter, setter)
     class_dict["___local_overrides___"] = overriden_attrs
-    return MetaWithConnection(class_name, (Stub,), class_dict, connection)
+    class_dict["___class_remote_class_name___"] = class_name
+    class_dict["___class_connection___"] = connection
+    return StubMetaClass(class_name, (Stub,), class_dict)

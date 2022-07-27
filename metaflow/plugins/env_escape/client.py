@@ -293,13 +293,15 @@ class Client(object):
         # This function is called to pickle obj to be transferred back to the
         # server. In this direction, we only allow objects that already exist
         # on the remote side so if this is not a stub, we do not allow it to be
-        # transferred
+        # transferred. We also allow the transfer of a "local class" that is proxied
+        # (so something that has a ___class_connection___).
         if getattr(obj, "___connection___", None) == self:
             # This is something we can transfer over
             return ObjReference(
                 VALUE_LOCAL, obj.___remote_class_name___, obj.___identifier___
             )
-
+        elif getattr(obj, "___class_connection___", None) == self:
+            return ObjReference(VALUE_LOCAL, obj.___remote_class_name___, 0)
         raise ValueError(
             "Cannot send object of type %s from client to server" % type(obj)
         )
@@ -311,10 +313,13 @@ class Client(object):
             raise ValueError("Invalid transferred object: %s" % str(obj))
         remote_class_name = obj.class_name
         obj_id = obj.identifier
-        local_instance = self._proxied_objects.get(obj_id)
+        local_instance = self._proxied_objects.get(obj_id) if obj_id else None
         if not local_instance:
             local_class = self.get_local_class(remote_class_name, obj_id)
-            local_instance = local_class(self, remote_class_name, obj_id)
+            if obj_id:
+                return local_class(self, remote_class_name, obj_id)
+            # If obj_id is zero, we just need to return the class itself
+            return local_class
         return local_instance
 
     def _get_canonical_name(self, name):

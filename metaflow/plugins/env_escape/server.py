@@ -33,9 +33,11 @@ from .consts import (
     OP_DIR,
     OP_CALLFUNC,
     OP_CALLONCLASS,
+    OP_GETATTRONCLASS,
     OP_GETVAL,
     OP_SETVAL,
     OP_INIT,
+    OP_NEW,
     VALUE_LOCAL,
     VALUE_REMOTE,
     CONTROL_GETEXPORTS,
@@ -222,9 +224,11 @@ class Server(object):
             OP_DIR: self._handle_dir,
             OP_CALLFUNC: self._handle_callfunc,
             OP_CALLONCLASS: self._handle_callonclass,
+            OP_GETATTRONCLASS: self._handle_getattronclass,
             OP_GETVAL: self._handle_getval,
             OP_SETVAL: self._handle_setval,
             OP_INIT: self._handle_init,
+            OP_NEW: self._handle_new,
         }
 
         self._local_objects = {}
@@ -311,7 +315,14 @@ class Server(object):
             kwargs = json_request.get(FIELD_KWARGS)
             if kwargs is not None:
                 kwargs = dict(self.decode(kwargs))
-
+            # print(
+            #     "[SERVER] OP %s(%s, %s)"
+            #     % (
+            #         str(op_type),
+            #         ", ".join([str(x) for x in args]),
+            #         ", ".join(["%s:%s" % (str(k), str(v)) for k, v in kwargs.items()]),
+            #     )
+            # )
             result = self._handlers[op_type](op_target, *args, **kwargs)
         except:  # noqa E722
             ex_type, ex, trace_back = sys.exc_info()
@@ -349,17 +360,31 @@ class Server(object):
         # locally and transfer an identifier for it
         identifier = id(obj)
         mapped_class_name = self._class_types_to_names.get(type(obj))
+        if mapped_class_name is None and isinstance(obj, type):
+            # We further check if this is just the class itself in which case we will
+            # return that.
+            mapped_class_name = self._class_types_to_names.get(obj)
+            identifier = 0
         if mapped_class_name is None:
+            if identifier == 0:
+                raise ValueError("Cannot proxy class object of type %s" % obj)
             raise ValueError("Cannot proxy value of type %s" % type(obj))
-        self._local_objects[identifier] = obj
+        if identifier != 0:
+            self._local_objects[identifier] = obj
         return ObjReference(VALUE_REMOTE, mapped_class_name, identifier)
 
     def unpickle_object(self, obj):
         if (not isinstance(obj, ObjReference)) or obj.value_type != VALUE_LOCAL:
             raise ValueError("Invalid transferred object: %s" % str(obj))
-        obj = self._local_objects.get(obj.identifier)
-        if obj:
-            return obj
+        if obj.identifier:
+            obj = self._local_objects.get(obj.identifier)
+            if obj:
+                return obj
+        else:
+            # The identifier is zero so we map this to a class itself
+            obj_cls = self._known_classes.get(obj.class_name)
+            if obj_cls:
+                return obj_cls
         raise ValueError("Invalid object -- id %s not known" % obj.identifier)
 
     @staticmethod
@@ -421,8 +446,8 @@ class Server(object):
         effective_protocol = min(self._max_pickle_version, proto)
         return pickle.dumps(target, protocol=effective_protocol)
 
-    def _handle_del(self, target):
-        del target
+    def _handle_del(self, target, identifier):
+        del self._local_objects[identifier]
 
     def _handle_getmethods(self, target, class_name):
         class_type = self._known_classes.get(class_name)
@@ -456,6 +481,19 @@ class Server(object):
                     return override_func(class_type, attr, *args, **kwargs)
         return attr(*args, **kwargs)
 
+    def _handle_getattronclass(self, target, class_name, name):
+        class_type = self._known_classes.get(class_name)
+        if class_type is None:
+            raise ValueError("Unknown class for class attribute %s" % class_name)
+        override_mapping = self._getattr_overrides.get(class_type)
+        if override_mapping:
+            override_func = override_mapping.get(name)
+            if override_func:
+                return override_func(class_type, name)
+        # TODO: This is not symetric -- we can't have a local override easily because
+        # of the way we construct the local getattr override (a property object)
+        return getattr(class_type, name)
+
     def _handle_getval(self, target, name):
         if name in self._known_vals:
             return self._known_vals[name]
@@ -466,11 +504,19 @@ class Server(object):
         if name in self._known_vals:
             self._known_vals[name] = value
 
-    def _handle_init(self, target, class_name, *args, **kwargs):
+    def _handle_new(self, target, class_name, *args, **kwargs):
         class_type = self._known_classes.get(class_name)
         if class_type is None:
             raise ValueError("Unknown class %s" % class_name)
-        return class_type(*args, **kwargs)
+        return class_type.__new__(class_type, *args, **kwargs)
+
+    def _handle_init(self, target, *args, **kwargs):
+        # print("Got args: %s" % ", ".join([str(x) for x in args]))
+        # print(
+        #    "Got kwargs: %s"
+        #    % ", ".join(["%s:%s" % (str(k), str(v)) for k, v in kwargs.items()])
+        # )
+        return target.__init__(*args, **kwargs)
 
 
 if __name__ == "__main__":

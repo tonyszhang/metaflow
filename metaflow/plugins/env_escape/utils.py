@@ -13,7 +13,8 @@ def get_methods(class_object):
     for base_class in mros:
         all_attributes.update(base_class.__dict__)
     for name, attribute in all_attributes.items():
-        if hasattr(attribute, "__call__"):
+        if hasattr(attribute, "__call__") and not isinstance(attribute, type):
+            # Classes are callable but we don't want that as a "method"
             all_methods[name] = inspect.getdoc(attribute)
         elif isinstance(attribute, staticmethod):
             all_methods["___s___%s" % name] = inspect.getdoc(attribute)
