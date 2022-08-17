@@ -1,6 +1,7 @@
 import re
 
 from metaflow.exception import MetaflowException
+from decimal import Decimal
 
 
 def get_docker_registry(image_uri):
@@ -83,7 +84,11 @@ def compute_resource_attributes(decos, compute_deco, resource_defaults):
                         # that numbers that can't be exactly represented as
                         # floats (e.g. 0.8) still look "nice". We don't care
                         # about precision more that .001 for resources anyway.
-                        result[k] = str(max(float(my_val or 0), float(v or 0)))
+                        result[k] = str(
+                            max(Decimal(my_val or 0), Decimal(v or 0))
+                            .quantize(Decimal(".001"))
+                            .normalize()
+                        )
                     except ValueError:
                         # Here, we don't have ints so we compare the value and raise
                         # an exception if not equal
