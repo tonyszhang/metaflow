@@ -9,6 +9,7 @@ from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
     BATCH_METADATA_SERVICE_HEADERS,
     BATCH_METADATA_SERVICE_URL,
+    CONDA_DEPENDENCY_RESOLVER,
     DATASTORE_CARD_S3ROOT,
     DATASTORE_SYSROOT_S3,
     DATATOOLS_S3ROOT,
@@ -192,6 +193,9 @@ class Kubernetes(object):
             .environment_variable("METAFLOW_KUBERNETES_WORKLOAD", 1)
             .environment_variable("METAFLOW_RUNTIME_ENVIRONMENT", "kubernetes")
             .environment_variable("METAFLOW_CARD_S3ROOT", DATASTORE_CARD_S3ROOT)
+            .environment_variable(
+                "METAFLOW_CONDA_DEPENDENCY_RESOLVER", CONDA_DEPENDENCY_RESOLVER
+            )
             .environment_variable(
                 "METAFLOW_DEFAULT_AWS_CLIENT_PROVIDER", DEFAULT_AWS_CLIENT_PROVIDER
             )

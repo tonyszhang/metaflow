@@ -11,6 +11,7 @@ from metaflow.datatools.s3tail import S3Tail
 from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
     BATCH_METADATA_SERVICE_URL,
+    CONDA_DEPENDENCY_RESOLVER,
     DATATOOLS_S3ROOT,
     DATASTORE_SYSROOT_S3,
     DEFAULT_METADATA,
@@ -231,6 +232,9 @@ class Batch(object):
             .environment_variable("METAFLOW_DEFAULT_DATASTORE", "s3")
             .environment_variable("METAFLOW_DEFAULT_METADATA", DEFAULT_METADATA)
             .environment_variable("METAFLOW_CARD_S3ROOT", DATASTORE_CARD_S3ROOT)
+            .environment_variable(
+                "METAFLOW_CONDA_DEPENDENCY_RESOLVER", CONDA_DEPENDENCY_RESOLVER
+            )
             .environment_variable("METAFLOW_RUNTIME_ENVIRONMENT", "aws-batch")
         )
         # Skip setting METAFLOW_DATASTORE_SYSROOT_LOCAL because metadata sync between the local user

@@ -12,6 +12,7 @@ from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
     BATCH_METADATA_SERVICE_HEADERS,
     BATCH_METADATA_SERVICE_URL,
+    CONDA_DEPENDENCY_RESOLVER,
     DATASTORE_CARD_S3ROOT,
     DATASTORE_SYSROOT_S3,
     DATATOOLS_S3ROOT,
@@ -367,6 +368,7 @@ class Airflow(object):
             "METAFLOW_DATATOOLS_S3ROOT": DATATOOLS_S3ROOT,
             "METAFLOW_DEFAULT_DATASTORE": "s3",
             "METAFLOW_DEFAULT_METADATA": "service",
+            "METAFLOW_CONDA_DEPENDENCY_RESOLVER": CONDA_DEPENDENCY_RESOLVER,
             "METAFLOW_KUBERNETES_WORKLOAD": str(
                 1
             ),  # This is used by kubernetes decorator.

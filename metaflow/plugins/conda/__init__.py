@@ -29,7 +29,7 @@ def read_conda_manifest(ds_root, flow_name):
         return {}
 
 
-def write_to_conda_manifest(ds_root, flow_name, key, value):
+def write_to_conda_manifest(ds_root, flow_name, envs):
     path = get_conda_manifest_path(ds_root, flow_name)
     try:
         os.makedirs(os.path.dirname(path))
@@ -43,7 +43,8 @@ def write_to_conda_manifest(ds_root, flow_name, key, value):
             if os.path.getsize(path) > 0:
                 f.seek(0)
                 data = json.load(f)
-            data[key] = value
+            for k, v in envs.items():
+                data[k] = v
             f.seek(0)
             json.dump(data, f)
             f.truncate()

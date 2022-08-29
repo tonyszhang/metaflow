@@ -10,6 +10,7 @@ from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
     BATCH_METADATA_SERVICE_HEADERS,
     BATCH_METADATA_SERVICE_URL,
+    CONDA_DEPENDENCY_RESOLVER,
     DATASTORE_CARD_S3ROOT,
     DATASTORE_SYSROOT_S3,
     DATATOOLS_S3ROOT,
@@ -764,6 +765,7 @@ class ArgoWorkflows(object):
                         "METAFLOW_DEFAULT_DATASTORE": self.flow_datastore.TYPE,
                         "METAFLOW_DEFAULT_METADATA": DEFAULT_METADATA,
                         "METAFLOW_CARD_S3ROOT": DATASTORE_CARD_S3ROOT,
+                        "METAFFLOW_CONDA_DEPENDENCY_RESOLVER": CONDA_DEPENDENCY_RESOLVER,
                         "METAFLOW_KUBERNETES_WORKLOAD": 1,
                         "METAFLOW_RUNTIME_ENVIRONMENT": "kubernetes",
                         "METAFLOW_OWNER": self.username,
