@@ -193,24 +193,24 @@ class CondaStepDecorator(StepDecorator):
         self.conda = Conda(self._echo, self.flow_datastore_type, mode="local")
         self.existing_environments = self.conda.environments(self._flow.name)
 
-    def runtime_task_created(
-        self, task_datastore, task_id, split_index, input_paths, is_cloned, ubf_context
-    ):
-        if self.is_enabled(ubf_context):
-            my_env_id = self.env_id
-            if my_env_id in self.existing_environments:
-                self._echo("Using existing Conda environment %s" % my_env_id)
-                return  # We already have the environment so we don't need to re-resolve
-            # Otherwise, we read the conda file and create the environment locally
-            self._echo("Creating Conda environment %s..." % my_env_id)
-            env_desc = read_conda_manifest(self._local_root, self._flow.name)[my_env_id]
-            self.conda.create(self._step_name, self.env_id, env_desc)
-
     def runtime_step_cli(
         self, cli_args, retry_count, max_user_code_retries, ubf_context
     ):
         no_force = all([x not in cli_args.commands for x in CONDA_FORCE_LINUX64])
         if self.is_enabled(ubf_context) and no_force:
+            # Create the environment we are going to use
+            my_env_id = self.env_id
+            if my_env_id in self.existing_environments:
+                self._echo("Using existing Conda environment %s" % my_env_id)
+            else:
+                # Otherwise, we read the conda file and create the environment locally
+                self._echo("Creating Conda environment %s..." % my_env_id)
+                env_desc = read_conda_manifest(self._local_root, self._flow.name)[
+                    my_env_id
+                ]
+                self.conda.create(self._step_name, self.env_id, env_desc)
+
+            # Actually set it up.
             python_path = self._metaflow_home
             if self.addl_paths is not None:
                 addl_paths = os.pathsep.join(self.addl_paths)

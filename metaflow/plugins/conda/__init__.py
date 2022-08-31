@@ -23,7 +23,7 @@ def get_conda_manifest_path(ds_root, flow_name):
 def read_conda_manifest(ds_root, flow_name):
     path = get_conda_manifest_path(ds_root, flow_name)
     if os.path.exists(path) and os.path.getsize(path) > 0:
-        with open(path) as f:
+        with open(path, mode="r", encoding="utf-8") as f:
             return json.load(f)
     else:
         return {}
@@ -36,7 +36,7 @@ def write_to_conda_manifest(ds_root, flow_name, envs):
     except OSError as x:
         if x.errno != errno.EEXIST:
             raise
-    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT), "r+") as f:
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT), "r+", encoding="utf-8") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX)
             data = {}

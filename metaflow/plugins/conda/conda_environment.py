@@ -144,10 +144,10 @@ class CondaEnvironment(MetaflowEnvironment):
     def _resolve_environments(self, echo, env_ids):
         start = time.time()
         if len(env_ids) == len(self._requested_envs):
-            echo("    Resolving %d environments in flow..." % len(env_ids), nl=False)
+            echo("    Resolving %d environments in flow  ..." % len(env_ids), nl=False)
         else:
             echo(
-                "    Resolving %d of %d environments in flows (others are cached)..."
+                "    Resolving %d of %d environments in flows (others are cached)  ..."
                 % (len(env_ids), len(self._requested_envs)),
                 nl=False,
             )
@@ -202,13 +202,6 @@ class CondaEnvironment(MetaflowEnvironment):
 
         # key: URL; value: {"hash" , "cache_path", "cached", "arch", "local_path"}
 
-        echo(
-            "    Caching dependencies of %d environments to %s ..."
-            % (len(env_ids), self._flow_datastore_type),
-            nl=False,
-        )
-        start = time.time()
-
         url_info = {}
         cache_to_file = {}
         upload_files = []
@@ -243,71 +236,49 @@ class CondaEnvironment(MetaflowEnvironment):
             if not exist:
                 upload_files.append(v)
 
-        my_arch = arch_id()
-        # We are now going to check if the file is already downloaded locally and
-        # see if the hash matches
-        package_dirs = self._conda.package_dirs
-        download_files = []
+        # Download anything we need to upload
         with tempfile.TemporaryDirectory() as download_dir:
+            pkgs_per_arch = {}
             for u in upload_files:
                 u_info = url_info[u]
-                if u_info["arch"] == my_arch:
-                    filename = u_info["file"]
-                    for p in package_dirs:
-                        path = os.path.join(p, filename)
-                        if os.path.isfile(path):
-                            # Check the md5 hash (is this really needed?)
-                            md5_hash = md5()
-                            with open(path, "rb") as f:
-                                for byte_block in iter(lambda: f.read(4096), b""):
-                                    md5_hash.update(byte_block)
-                            if md5_hash.hexdigest() == u_info["hash"]:
-                                u_info["local_path"] = path
-                                break
-                    else:
-                        # We can download directly in one of the pkg dirs to save
-                        # on having to download again if we need it. We use the
-                        # first path
-                        new_local_path = os.path.join(package_dirs[0], filename)
-                        u_info["local_path"] = new_local_path
-                        download_files.append((u, new_local_path))
-                else:
-                    new_local_path = os.path.join(download_dir, u_info["file"])
-                    u_info["local_path"] = new_local_path
-                    download_files.append((u, new_local_path))
-            # We now download all the files we need
-            def _download(entry):
-                url, local_path = entry
-                print(
-                    "Going to fetch %s to store in %s of type %s"
-                    % (url, local_path, type(url))
+                to_update = pkgs_per_arch.setdefault(
+                    u_info["arch"],
+                    {"filenames": [], "urls": [], "cache_urls": [], "file_hashes": []},
                 )
-                with requests.get(url, stream=True) as r:
-                    print("Fetched %s to write to %s" % (url, local_path), flush=True)
-                    with open(local_path, "wb") as f:
-                        print("In open %s" % local_path, flush=True)
-                        # TODO: We could check the hash here
-                        shutil.copyfileobj(r.raw, f)
+                to_update["filenames"].append(u_info["file"])
+                to_update["urls"].append(u)
+                to_update["cache_urls"].append(
+                    None
+                )  # We definitely don't have it cached
+                to_update["file_hashes"].append(u_info["hash"])
 
-            if download_files:
-                echo("  fetching %d packages ..." % len(download_files), nl=False)
-                for entry in download_files:
-                    _download(entry)
-                # Pool().imap_unordered(_download, download_files)
-                echo("  done", nl=False)
+            for arch, pkgs_info in pkgs_per_arch.items():
+                arch_tmpdir = os.mkdir(os.path.join(download_dir, arch))
+                results = self._conda.lazy_fetch_packages(
+                    pkgs_info["filenames"],
+                    pkgs_info["urls"],
+                    pkgs_info["cache_urls"],
+                    pkgs_info["file_hashes"],
+                    require_tarball=True,
+                    requested_arch=arch,
+                    tempdir=arch_tmpdir,
+                )
+                for r in results:
+                    url_info[r.url]["local_path"] = r.local_path
 
             # At this point, we can upload all the files we need to the storage
             paths_and_handles = [
                 (url_info[u]["cache_path"], open(url_info[u]["local_path"], "rb"))
                 for u in upload_files
             ]
+            start = time.time()
             echo(
-                "  uploading %d packages to %s ..."
+                "    Caching %d packages to %s ..."
                 % (len(paths_and_handles), self._flow_datastore_type),
                 nl=False,
             )
             storage.save_bytes(paths_and_handles, len_hint=len(paths_and_handles))
-            echo("  done", nl=False)
+            echo("  done in %d seconds." % int(time.time() - start), nl=False)
 
         # At this point, we can update _cached_deps with the proper information since
         # we now have everything stored
@@ -316,8 +287,6 @@ class CondaEnvironment(MetaflowEnvironment):
                 url_info[k]["cache_path"] for k in self._cached_deps[env_id]["urls"]
             ]
             self._cached_deps[env_id]["cache_urls"] = cache_urls
-        duration = int(time.time() - start)
-        echo("  done in %d seconds." % duration)
 
     def _get_conda_decorator(self, step_name):
         step = next(step for step in self._flow if step.name == step_name)
@@ -338,7 +307,7 @@ class CondaEnvironment(MetaflowEnvironment):
         if env_id is not None:
             # The create method in Conda() sets up this symlink when creating the
             # environment.
-            return os.path.join(os.getcwd(), "__conda_python")
+            return os.path.join(".", "__conda_python")
         return None
 
     def bootstrap_commands(self, step_name, datastore_type):

@@ -10,10 +10,12 @@ import subprocess
 import tarfile
 import tempfile
 import time
+
+from collections import namedtuple
 from distutils.version import LooseVersion
 
 from metaflow.datastore import DATASTORES
-from metaflow.exception import MetaflowException
+from metaflow.exception import MetaflowException, MetaflowInternalError
 from metaflow.metaflow_config import (
     CONDA_DEPENDENCY_RESOLVER,
     CONDA_LOCAL_DIST_DIRNAME,
@@ -28,6 +30,21 @@ from metaflow.plugins.conda import arch_id, get_conda_root, get_conda_package_ro
 from metaflow.util import which
 
 _CONDA_DEP_RESOLVERS = ("conda", "mamba")
+
+
+LazyFetchResult = namedtuple(
+    "LazyFetchResult", "filename url cache_url local_path fetched cached is_dir"
+)
+
+TransmuteResult = namedtuple("TransmuteResult", "orig_path new_path new_hash error")
+
+
+def _get_md5_hash(path):
+    md5_hash = md5()
+    with open(path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            md5_hash.update(byte_block)
+    return md5_hash.hexdigest()
 
 
 class CondaException(MetaflowException):
@@ -106,9 +123,11 @@ class Conda(object):
                     "-k",
                     "explicit",
                     "--conda",
-                    self._bins["conda"],
+                    self._bins.get("micromamba", self._bins["conda"]),
                 ]
-                if self._dependency_solver == "mamba":
+                if "micromamba" in self._bins:
+                    args.append("--micromamba")
+                elif self._dependency_solver == "mamba":
                     args.append("--mamba")
                 self._call_conda(args, binary="conda-lock")
             # At this point, we need to read the explicit dependencies in the file created
@@ -181,6 +200,282 @@ class Conda(object):
                         ret[name] = env
         return ret
 
+    def lazy_fetch_packages(
+        self,
+        filenames,
+        urls,
+        cache_urls,
+        file_hashes,
+        require_tarball=False,
+        requested_arch=arch_id(),
+        tempdir=None,
+    ):
+        # Lazily fetch filenames into the pkgs directory.
+        # filenames, urls, cache_urls, file_hashes are all arrays of the same size with
+        # a 1:1 correspondance between them
+        #  - If the file exists as a tarball (or as a directory if require_tarball is False),
+        #    do nothing.
+        #  - If the file does not exist:
+        #    - if a cache_url exists, fetch that
+        #    - if not, fetch from urls
+        #
+        # Returns a list of tuple: (fetched, filename, url/cache_url, local_path) where:
+        #  - fetched is a boolean indicating if we needed to fetch the file
+        #  - filename is the filename
+        #  -
+        # is None if not fetched
+
+        def _download_web(entry):
+            url, local_path = entry
+            try:
+                with requests.get(url, stream=True) as r:
+                    with open(local_path, "wb") as f:
+                        # TODO: We could check the hash here
+                        shutil.copyfileobj(r.raw, f)
+            except Exception as e:
+                return (url, e)
+            return None
+
+        results = []
+        use_package_dirs = True
+        if requested_arch != arch_id():
+            if tempdir is None:
+                raise MetaflowInternalError(
+                    "Cannot lazily fetch packages for another architecture "
+                    "without a temporary directory"
+                )
+            use_package_dirs = False
+
+        cache_downloads = []
+        web_downloads = []
+        url_adds = []
+        known_urls = set()
+        if use_package_dirs:
+            package_dirs = self._package_dirs
+            for p in package_dirs:
+                with CondaLock(self._package_dir_lock_file(p)):
+                    url_file = os.path.join(p, "urls.txt")
+                    if os.path.isfile(url_file):
+                        with open(url_file, "rb") as f:
+                            known_urls.update([l.strip().decode("utf-8") for l in f])
+        else:
+            package_dirs = [tempdir]
+
+        for filename, base_url, cache_url, file_hash in zip(
+            filenames, urls, cache_urls, file_hashes
+        ):
+            for p in [d for d in package_dirs if os.path.isdir(d)]:
+                path = os.path.join(p, filename)
+                extract_path = None
+                if not require_tarball:
+                    if filename.endswith(".tar.bz2"):
+                        extract_path = os.path.join(p, filename[:-8])
+                    elif filename.endswith(".conda"):
+                        extract_path = os.path.join(p, filename[:-5])
+
+                if extract_path and os.path.isdir(extract_path):
+                    print("Found directory: %s" % extract_path)
+                    results.append(
+                        LazyFetchResult(
+                            filename=filename,
+                            url=base_url,
+                            cache_url=cache_url,
+                            local_path=extract_path,
+                            fetched=False,
+                            cached=False,
+                            is_dir=True,
+                        )
+                    )
+                    break
+                elif os.path.isfile(path):
+                    print("Found file %s" % path)
+                    md5_hash = _get_md5_hash(path)
+                    if md5_hash == file_hash:
+                        results.append(
+                            LazyFetchResult(
+                                filename=filename,
+                                url=base_url,
+                                cache_url=cache_url,
+                                local_path=path,
+                                fetched=False,
+                                cached=False,
+                                is_dir=False,
+                            )
+                        )
+                        break
+                    else:
+                        print(
+                            "Hash computed as %s -- expected %s" % (md5_hash, file_hash)
+                        )
+            else:
+                # We need to download this file; check if it is a regular download
+                # or one from the cache
+                if base_url not in known_urls:
+                    # In some cases the url is in urls.txt but the package has been
+                    # cleaned up. In other words, urls.txt does not seem to be kept up
+                    # to date -- it's like an append only thing.
+                    url_adds.append("%s\n" % base_url)
+                if cache_url:
+                    cache_downloads.append(
+                        (cache_url, os.path.join(package_dirs[0], filename))
+                    )
+                    results.append(
+                        LazyFetchResult(
+                            filename=filename,
+                            url=base_url,
+                            cache_url=cache_url,
+                            local_path=os.path.join(package_dirs[0], filename),
+                            fetched=True,
+                            cached=True,
+                            is_dir=False,
+                        )
+                    )
+                else:
+                    web_downloads.append(
+                        (base_url, os.path.join(package_dirs[0], filename))
+                    )
+                    results.append(
+                        LazyFetchResult(
+                            filename=filename,
+                            url=base_url,
+                            cache_url=cache_url,
+                            local_path=os.path.join(package_dirs[0], filename),
+                            fetched=True,
+                            cached=False,
+                            is_dir=False,
+                        )
+                    )
+        do_download = web_downloads or cache_downloads
+        if do_download:
+            start = time.time()
+            self._echo(
+                "    Downloading %d(web) + %d(cache) packages out of %d  ..."
+                % (len(web_downloads), len(cache_downloads), len(filenames)),
+                nl=False,
+            )
+
+        # Ensure the packages directory exists at the very least
+        if do_download and not os.path.isdir(package_dirs[0]):
+            os.makedirs(package_dirs[0])
+
+        # Could parallelize this again but unlikely to see a huge gain
+        if web_downloads:
+            errors = [
+                r
+                for r in Pool().imap_unordered(_download_web, web_downloads)
+                if r is not None
+            ]
+            if errors:
+                raise CondaException("Error downloading packages: %s" % str(errors))
+
+        if cache_downloads:
+            conda_package_root = get_conda_package_root(self._datastore_type)
+            storage = DATASTORES[self._datastore_type](conda_package_root)
+            errors = []
+            with storage.load_bytes([x[0] for x in cache_downloads]) as load_results:
+                for (key, tmpfile, _), local_file in zip(
+                    load_results, [x[1] for x in cache_downloads]
+                ):
+                    if not tmpfile:
+                        errors.append(key)
+                    shutil.move(tmpfile, local_file)
+            if errors:
+                raise CondaException(
+                    "Could not download the following cached packages (missing): %s"
+                    % str(errors)
+                )
+        if url_adds:
+            # Update the urls file in the packages directory so that Conda knows that the
+            # files are there
+            with CondaLock(self._package_dir_lock_file(package_dirs[0])):
+                with open(
+                    os.path.join(package_dirs[0], "urls.txt"),
+                    mode="a",
+                    encoding="utf-8",
+                ) as f:
+                    f.writelines(url_adds)
+        if do_download:
+            self._echo("  done in %d seconds." % int(time.time() - start))
+        return results
+
+    def transmute_packages(
+        self,
+        orig_paths,
+        orig_urls,
+        new_format=".conda",
+        replace_origs=False,
+        output_dir=None,
+    ):
+        # Transmute packages to new_format.
+        # - replace_origs: If True, replace old packages with the new ones and
+        #   update urls.txt if needed
+        # - output_dir: If set, use this directory for new packages. If not specified,
+        #   use the same directory.
+        # Returns a list of TransmuteResult
+        if new_format == ".conda":
+            old_format = ".tar.bz2"
+        else:
+            old_format = ".conda"
+
+        if "cph" not in self._bins:
+            raise CondaException(
+                "Cannot transmute packages without `cph`. "
+                "Please install using `%s install -n base conda-package-handling"
+                % self._dependency_solver
+            )
+
+        def _transmute(orig_path):
+            args = ["t", "--processes", "1", "--force", "--output-dir"]
+            old_name = os.path.basename(orig_path)
+            if not old_name.endswith(old_format):
+                return (
+                    orig_path,
+                    MetaflowInternalError(
+                        "Package %s does not end in %s" % (orig_path, old_format)
+                    ),
+                )
+            new_name = old_name[: -len(old_format)] + new_format
+            if output_dir:
+                args.append(output_dir)
+                new_path = os.path.join(output_dir, new_name)
+            else:
+                args.append(os.path.dirname(orig_path))
+                new_path = os.path.join(os.path.dirname(orig_path), old_name)
+            args.extend([orig_path, new_format])
+            try:
+                self._call_conda(args, binary="cph")
+            except CondaException as e:
+                return (orig_path, e)
+            else:
+                if replace_origs:
+                    os.unlink(orig_path)
+            return (orig_path, new_path)
+
+        if output_dir is not None and replace_origs:
+            raise MetaflowInternalError(
+                "Cannot specify an output_dir and replace_origs in transmute_packages"
+            )
+        transmute_results = Pool().imap_unordered(_transmute, orig_paths)
+        results = []
+        # TODO: Update urls.txt removing the old ones and adding the new ones.
+        for orig_path, result in transmute_results:
+            if isinstance(result, Exception):
+                results.append(
+                    TransmuteResult(
+                        orig_path=orig_path, new_path=None, new_hash=None, error=result
+                    )
+                )
+            else:
+                results.append(
+                    TransmuteResult(
+                        orig_path=orig_path,
+                        new_path=result,
+                        new_hash=_get_md5_hash(result),
+                        error=None,
+                    )
+                )
+        return results
+
     def _resolve_conda_binary(self):
         self._dependency_solver = CONDA_DEPENDENCY_RESOLVER.lower()
         if self._dependency_solver not in _CONDA_DEP_RESOLVERS:
@@ -206,6 +501,7 @@ class Conda(object):
                 "conda": os.path.join(CONDA_LOCAL_PATH, "bin", self._dependency_solver),
                 "conda-lock": os.path.join(CONDA_LOCAL_PATH, "bin", "conda-lock"),
                 "micromamba": os.path.join(CONDA_LOCAL_PATH, "bin", "micromamba"),
+                "cph": os.path.join(CONDA_LOCAL_PATH, "bin", "cph"),
             }
             if self._validate_conda_installation():
                 # This means we have an exception so we are going to try to install
@@ -221,12 +517,13 @@ class Conda(object):
                 "conda": which(self._dependency_solver),
                 "conda-lock": which("conda-lock"),
                 "micromamba": which("micromamba"),
+                "cph": which("cph"),
             }
 
     def _install_local_conda(self):
         start = time.time()
         path = CONDA_LOCAL_PATH
-        self._echo("    Installing Conda environment at %s..." % path, nl=False)
+        self._echo("    Installing Conda environment at %s  ..." % path, nl=False)
         shutil.rmtree(CONDA_LOCAL_PATH, ignore_errors=True)
 
         try:
@@ -322,7 +619,7 @@ class Conda(object):
                         "No %s installation found. Install %s first."
                         % (self._dependency_solver, self._dependency_solver)
                     )
-                elif k == "micromamba":
+                elif k in ("micromamba", "cph"):
                     # This is an optional install so we ignore if not present
                     to_remove.append(k)
                 else:
@@ -343,27 +640,36 @@ class Conda(object):
             if LooseVersion(self._info["conda_version"]) < LooseVersion("4.6.0"):
                 msg = "Conda version 4.6.0 or newer is required."
                 if self._dependency_solver == "mamba":
-                    msg += " Visit https://mamba.readthedocs.io/en/latest/installation.html for installation instructions."
+                    msg += (
+                        " Visit https://mamba.readthedocs.io/en/latest/installation.html "
+                        "for installation instructions."
+                    )
                 else:
-                    msg += " Visit https://docs.conda.io/en/latest/miniconda.html for installation instructions."
+                    msg += (
+                        " Visit https://docs.conda.io/en/latest/miniconda.html "
+                        "for installation instructions."
+                    )
                 return InvalidEnvironmentException(msg)
         else:
             # Should never happen since we check for it but making it explicit
             raise InvalidEnvironmentException(
                 "Unknown dependency solver: %s" % self._dependency_solver
             )
-        # Check if conda-forge is available as a channel to pick up Metaflow's
-        # dependencies. This check will go away once all of Metaflow's
-        # dependencies are vendored in.
-        if "conda-forge" not in "\t".join(self._info["channels"]):
-            return InvalidEnvironmentException(
-                "Conda channel 'conda-forge' is required. Specify it with CONDA_CHANNELS environment variable."
-            )
+
+        if self._mode == "local":
+            # Check if conda-forge is available as a channel to pick up Metaflow's
+            # dependencies. This check will go away once all of Metaflow's
+            # dependencies are vendored in.
+            if "conda-forge" not in "\t".join(self._info["channels"]):
+                return InvalidEnvironmentException(
+                    "Conda channel 'conda-forge' is required. "
+                    "Specify it with CONDA_CHANNELS environment variable."
+                )
 
         return None
 
     @property
-    def package_dirs(self):
+    def _package_dirs(self):
         info = self._info
         if self._have_micromamba:
             pkg_dir = os.path.join(info["base environment"], "pkgs")
@@ -375,110 +681,19 @@ class Conda(object):
     @property
     def _info(self):
         if self._cached_info is None:
-            import traceback
-
-            traceback.print_stack()
             self._cached_info = json.loads(self._call_conda(["info", "--json"]))
         return self._cached_info
 
-    def _fetch_packages(self, env_desc):
-        def _download_web(entry):
-            url, local_path = entry
-            with requests.get(url, stream=True) as r:
-                with open(local_path, "wb") as f:
-                    # TODO: We could check the hash here
-                    shutil.copyfileobj(r.raw, f)
-
-        package_dirs = self.package_dirs
-        cache_downloads = []
-        web_downloads = []
-        url_adds = []
-        cache_urls = env_desc.get("cache_urls", [None] * len(env_desc["urls"]))
-        known_urls = set()
-        for p in package_dirs:
-            url_file = os.path.join(p, "urls.txt")
-            if os.path.isfile(url_file):
-                with open(url_file, "rb") as f:
-                    known_urls.update([l.strip().decode("utf-8") for l in f])
-
-        for filename, base_url, cache_url, file_hash in zip(
-            env_desc["order"], env_desc["urls"], cache_urls, env_desc["hashes"]
-        ):
-            for p in package_dirs:
-                path = os.path.join(p, filename)
-                extract_path = None
-                if filename.endswith(".tar.bz2"):
-                    extract_path = os.path.join(p, filename[:-8])
-                elif filename.endswith(".conda"):
-                    extract_path = os.path.join(p, filename[:-5])
-
-                if extract_path and os.path.isdir(extract_path):
-                    print("Found extracted directory %s" % extract_path)
-                    break
-                elif os.path.isfile(path):
-                    print("Found file %s" % path)
-                    # Check the md5 hash (is this really needed?)
-                    md5_hash = md5()
-                    with open(path, "rb") as f:
-                        for byte_block in iter(lambda: f.read(4096), b""):
-                            md5_hash.update(byte_block)
-                    if md5_hash.hexdigest() == file_hash:
-                        break
-                    else:
-                        print(
-                            "Hash computed as %s -- expected %s"
-                            % (md5_hash.hexdigest(), file_hash)
-                        )
-            else:
-                # We need to download this file; check if it is a regular download
-                # or one from the cache
-                if base_url not in known_urls:
-                    # In some cases the url is in urls.txt but the package has been
-                    # cleaned up. In other words, urls.txt does not seem to be kept up
-                    # to date -- it's like an append only thing.
-                    url_adds.append("%s\n" % base_url)
-                if cache_url:
-                    cache_downloads.append(
-                        (cache_url, os.path.join(package_dirs[0], filename))
-                    )
-                else:
-                    web_downloads.append(
-                        (base_url, os.path.join(package_dirs[0], filename))
-                    )
-        start = time.time()
-        self._echo(
-            "    Downloading %d(web) + %d(cache) packages out of %d..."
-            % (len(web_downloads), len(cache_downloads), len(env_desc["order"])),
-            nl=False,
-        )
-        # Could parallelize this again but unlikely to see a huge gain
-        if web_downloads:
-            Pool().imap_unordered(_download_web, web_downloads)
-        if cache_downloads:
-            conda_package_root = get_conda_package_root(self._datastore_type)
-            storage = DATASTORES[self._datastore_type](conda_package_root)
-            with storage.load_bytes([x[0] for x in cache_downloads]) as load_results:
-                for (_, tmpfile, _), local_file in zip(
-                    load_results, [x[1] for x in cache_downloads]
-                ):
-                    shutil.move(tmpfile, local_file)
-        if url_adds:
-            # Update the urls file in the packages directory so that Conda knows that the
-            # files are there
-            with open(
-                os.path.join(package_dirs[0], "urls.txt"), mode="a", encoding="utf-8"
-            ) as f:
-                f.writelines(url_adds)
-
-        self._echo(" done in %d seconds." % int(time.time() - start), timestamp=False)
-
     def _create(self, env_id, env_desc):
         # We first get all the packages needed
-        self._fetch_packages(env_desc)
+        cache_urls = env_desc.get("cache_urls", [None] * len(env_desc["urls"]))
+        self.lazy_fetch_packages(
+            env_desc["order"], env_desc["urls"], cache_urls, env_desc["hashes"]
+        )
         # At this point, we have all the packages that we need so we should be able to
         # just install directly
         start = time.time()
-        self._echo("    Linking Conda environment...", nl=False)
+        self._echo("    Extracting and linking Conda environment ...", nl=False)
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="ascii", delete=False
         ) as explicit_list:
@@ -536,6 +751,9 @@ class Conda(object):
 
         return os.path.join(self._info["envs_dirs"][0], "mf_env-creation.lock")
 
+    def _package_dir_lock_file(self, dir):
+        return os.path.join(dir, "mf_pkgs-update.lock")
+
     def _call_conda(
         self, args, binary="conda", architecture=None, disable_safety_checks=False
     ):
@@ -543,7 +761,6 @@ class Conda(object):
             env = {
                 "CONDA_JSON": "True",
                 "CONDA_SUBDIR": (architecture if architecture else ""),
-                "CONDA_USE_ONLY_TAR_BZ2": "True",
                 "MAMBA_NO_BANNER": "1",
                 "MAMBA_JSON": "True",
             }
@@ -553,7 +770,7 @@ class Conda(object):
                 # Add a few options to make sure it plays well with conda/mamba
                 # NOTE: This is only if we typically have conda/mamba and are using
                 # micromamba. When micromamba is used by itself, we don't do this
-                args.extend(["-r", os.path.dirname(self.package_dirs[0])])
+                args.extend(["-r", os.path.dirname(self._package_dirs[0])])
             print("Calling %s" % str([self._bins[binary]] + args))
             return subprocess.check_output(
                 [self._bins[binary]] + args,

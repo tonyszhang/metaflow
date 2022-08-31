@@ -2,30 +2,39 @@ import json
 import os
 import shutil
 import sys
+import time
 
 from metaflow.metaflow_config import (
     DATASTORE_LOCAL_DIR,
     CONDA_MAGIC_FILE,
 )
 
-from metaflow.cli import echo
+from metaflow.cli import echo_always
 
 from ..env_escape import generate_trampolines, ENV_ESCAPE_PY
 
 from .conda import Conda
 
 
+def my_echo_always(*args, **kwargs):
+    kwargs["err"] = False
+    return echo_always(*args, **kwargs)
+
+
 def bootstrap_environment(flow_name, step_name, env_id, datastore_type):
-    print("Setting up Conda...")
-    my_conda = Conda(echo, datastore_type, mode="remote")
+    start = time.time()
+    my_echo_always("    Setting up Conda ...", nl=False)
+    my_conda = Conda(my_echo_always, datastore_type, mode="remote")
     setup_conda_manifest(flow_name)
     manifest_folder = os.path.join(os.getcwd(), DATASTORE_LOCAL_DIR, flow_name)
+    my_echo_always("  done in %d seconds." % int(time.time() - start))
 
-    # Fetch all packages
-    with open(os.path.join(manifest_folder, CONDA_MAGIC_FILE)) as f:
+    with open(
+        os.path.join(manifest_folder, CONDA_MAGIC_FILE), mode="r", encoding="utf-8"
+    ) as f:
         env = json.load(f)[env_id]
 
-    # Install the environment
+    # Install the environment; this will fetch packages as well.
     my_conda.create(step_name, env_id, env, do_symlink=True)
 
     # Setup anything needed by the escape hatch
