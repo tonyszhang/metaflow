@@ -371,13 +371,19 @@ CONDA_LOCAL_DIST = from_conf("METAFLOW_CONDA_LOCAL_DIST", "conda-{arch}.tgz")
 # CONDA_LOCAL_DIST_DIRNAME and CONDA_LOCAL_DIST
 CONDA_LOCAL_PATH = from_conf("METAFLOW_CONDA_LOCAL_PATH")
 
+# Preferred Format for Conda packages
+CONDA_PREFERRED_FORMAT = from_conf(
+    "METAFLOW_CONDA_PREFERRED_FORMAT",
+    ".tar.bz2",
+    _get_validate_choice_fn([".tar.bz2", ".conda"]),
+)
 # HACK
 CONDA_FORCE_LINUX64 = ("batch", "kubernetes")
 
 ###
 # Debug configuration
 ###
-DEBUG_OPTIONS = ["subcommand", "sidecar", "s3client"]
+DEBUG_OPTIONS = ["subcommand", "sidecar", "s3client", "conda"]
 
 for typ in DEBUG_OPTIONS:
     vars()["METAFLOW_DEBUG_%s" % typ.upper()] = from_conf(

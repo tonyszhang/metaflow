@@ -27,7 +27,7 @@ def bootstrap_environment(flow_name, step_name, env_id, datastore_type):
     my_conda = Conda(my_echo_always, datastore_type, mode="remote")
     setup_conda_manifest(flow_name)
     manifest_folder = os.path.join(os.getcwd(), DATASTORE_LOCAL_DIR, flow_name)
-    my_echo_always("  done in %d seconds." % int(time.time() - start))
+    my_echo_always(" done in %d seconds." % int(time.time() - start))
 
     with open(
         os.path.join(manifest_folder, CONDA_MAGIC_FILE), mode="r", encoding="utf-8"

@@ -3,6 +3,7 @@ from hashlib import md5
 from multiprocessing.dummy import Pool
 import os
 import json
+import typing
 import requests
 import shutil
 import stat
@@ -14,7 +15,10 @@ import time
 from collections import namedtuple
 from distutils.version import LooseVersion
 
+from urllib.parse import urlparse
+
 from metaflow.datastore import DATASTORES
+from metaflow.debug import debug
 from metaflow.exception import MetaflowException, MetaflowInternalError
 from metaflow.metaflow_config import (
     CONDA_DEPENDENCY_RESOLVER,
@@ -24,27 +28,22 @@ from metaflow.metaflow_config import (
     CONDA_LOCK_TIMEOUT,
     CONDA_REMOTE_INSTALLER,
     CONDA_REMOTE_INSTALLER_DIRNAME,
+    CONDA_PREFERRED_FORMAT,
 )
 from metaflow.metaflow_environment import InvalidEnvironmentException
 from metaflow.plugins.conda import arch_id, get_conda_root, get_conda_package_root
 from metaflow.util import which
 
+from . import get_md5_hash, CONDA_FORMATS, TRANSMUT_PATHCOMPONENT
+
 _CONDA_DEP_RESOLVERS = ("conda", "mamba")
 
+# per_format_desc is a dictionary containing cache_url, local_path,
+# fetched, cached and transmuted
+# Move to dataclasses for Py 3.7+
+LazyFetchResult = namedtuple("LazyFetchResult", "filename url is_dir per_format_desc")
 
-LazyFetchResult = namedtuple(
-    "LazyFetchResult", "filename url cache_url local_path fetched cached is_dir"
-)
-
-TransmuteResult = namedtuple("TransmuteResult", "orig_path new_path new_hash error")
-
-
-def _get_md5_hash(path):
-    md5_hash = md5()
-    with open(path, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            md5_hash.update(byte_block)
-    return md5_hash.hexdigest()
+ParseURLResult = namedtuple("ParseURLResult", "filename format hash is_transmuted")
 
 
 class CondaException(MetaflowException):
@@ -66,6 +65,85 @@ class CondaStepException(CondaException):
 
 
 class Conda(object):
+    @staticmethod
+    def _convert_filepath(path, file_format=None):
+        if file_format and not path.endswith(file_format):
+            for f in CONDA_FORMATS:
+                if path.endswith(f):
+                    path = path[: -len(f)] + file_format
+                    break
+            else:
+                raise CondaException(
+                    "URL '%s' does not end with a supported file format %s"
+                    % (path, str(CONDA_FORMATS))
+                )
+        return os.path.split(path)
+
+    def _make_urlstxt_from_url(self, base_url, file_format=None, is_transmuted=False):
+        if not is_transmuted:
+            return base_url
+        url = urlparse(base_url)
+        file_path, filename = Conda._convert_filepath(url.path, file_format)
+        return os.path.join(
+            get_conda_package_root(self._datastore_type),
+            TRANSMUT_PATHCOMPONENT,
+            url.netloc,
+            file_path.lstrip("/"),
+            filename,
+        )
+
+    def _make_urlstxt_from_cacheurl(self, cache_url):
+        if TRANSMUT_PATHCOMPONENT in cache_url:
+            return os.path.join(
+                get_conda_package_root(self._datastore_type),
+                os.path.split(os.path.split(cache_url)[0])[
+                    0
+                ],  # Strip off last two (hash and filename)
+            )
+        else:
+            return "https://" + os.path.split(os.path.split(cache_url)[0])[0]
+
+    @staticmethod
+    def make_cache_url(base_url, file_hash, file_format=None, is_transmuted=False):
+        url = urlparse(base_url)
+        file_path, filename = Conda._convert_filepath(url.path, file_format)
+
+        if is_transmuted:
+            return os.path.join(
+                TRANSMUT_PATHCOMPONENT,
+                url.netloc,
+                file_path.lstrip("/"),
+                filename,
+                file_hash,
+                filename,
+            )
+        else:
+            return os.path.join(
+                url.netloc, file_path.lstrip("/"), filename, file_hash, filename
+            )
+
+    @staticmethod
+    def parse_cache_url(url):
+        basename, filename = os.path.split(url)
+        file_format = None
+        for f in CONDA_FORMATS:
+            if filename.endswith(f):
+                file_format = f
+                break
+        else:
+            raise CondaException(
+                "URL '%s' does not end with a supported file format %s"
+                % (url, str(CONDA_FORMATS))
+            )
+        basename, file_hash = os.path.split(basename)
+        is_transmuted = TRANSMUT_PATHCOMPONENT in basename
+        return ParseURLResult(
+            filename=filename,
+            format=file_format,
+            hash=file_hash,
+            is_transmuted=is_transmuted,
+        )
+
     def __init__(self, echo, datastore_type, mode="local"):
         from metaflow.cli import logger
 
@@ -206,15 +284,15 @@ class Conda(object):
         urls,
         cache_urls,
         file_hashes,
-        require_tarball=False,
+        require_format=None,
         requested_arch=arch_id(),
         tempdir=None,
     ):
         # Lazily fetch filenames into the pkgs directory.
         # filenames, urls, cache_urls, file_hashes are all arrays of the same size with
         # a 1:1 correspondance between them
-        #  - If the file exists as a tarball (or as a directory if require_tarball is False),
-        #    do nothing.
+        #  - If the file exists in the all the required formats (or as a directory if
+        #    require_format is None)
         #  - If the file does not exist:
         #    - if a cache_url exists, fetch that
         #    - if not, fetch from urls
@@ -225,18 +303,11 @@ class Conda(object):
         #  -
         # is None if not fetched
 
-        def _download_web(entry):
-            url, local_path = entry
-            try:
-                with requests.get(url, stream=True) as r:
-                    with open(local_path, "wb") as f:
-                        # TODO: We could check the hash here
-                        shutil.copyfileobj(r.raw, f)
-            except Exception as e:
-                return (url, e)
-            return None
-
         results = []
+
+        if require_format is None:
+            require_format = []
+
         use_package_dirs = True
         if requested_arch != arch_id():
             if tempdir is None:
@@ -246,111 +317,271 @@ class Conda(object):
                 )
             use_package_dirs = False
 
-        cache_downloads = []
-        web_downloads = []
-        url_adds = []
-        known_urls = set()
+        cache_downloads = []  # Contains a list of (src_cache, filename, dst_local_file)
+        web_downloads = []  # Contains a list of (filename, src_url, dst_local_file)
+        # Contains a list of (filename, format, src_local_file, dst_local_file, urltxt_to_add)
+        transmutes = []
+        url_adds = []  # List of URLs to add to urls.txt
+        known_urls = set()  # Set of URLs already in urls.txt
+
+        # Helper functions
+        def _add_to_downloads_list_and_results(filename, pkg_format, mode, src, dst):
+            if mode == "cache":
+                cache_downloads.append((src, filename, dst))
+                return {
+                    pkg_format: {
+                        "cache_url": src,
+                        "local_path": dst,
+                        "fetched": True,
+                        "cached": True,
+                        "transmuted": False,
+                    }
+                }
+            elif mode == "web":
+                web_downloads.append((filename, src, dst))
+                return {
+                    pkg_format: {
+                        "cache_url": None,
+                        "local_path": dst,
+                        "fetched": True,
+                        "cached": False,
+                        "transmuted": False,
+                    }
+                }
+            elif mode == "local":
+                return {
+                    pkg_format: {
+                        "cache_url": None,
+                        "local_path": src,
+                        "fetched": False,
+                        "cached": False,
+                        "transmuted": False,
+                    }
+                }
+
+        def _download_web(entry):
+            filename, url, local_path = entry
+            debug.conda_exec("%s -> download %s to %s" % (filename, url, local_path))
+            try:
+                with requests.get(url, stream=True) as r:
+                    with open(local_path, "wb") as f:
+                        # TODO: We could check the hash here
+                        shutil.copyfileobj(r.raw, f)
+            except Exception as e:
+                return (filename, url, e)
+            return (filename, url, None)
+
+        def _transmute(entry):
+            filename, new_format, src_file, dst_file, resulting_url = entry
+            debug.conda_exec(
+                "%s -> transmute %s to %s" % (filename, src_file, dst_file)
+            )
+            try:
+                args = [
+                    "t",
+                    "--processes",
+                    "1",
+                    "--force",
+                    "--out-folder",
+                    os.path.dirname(dst_file),
+                    src_file,
+                    new_format,
+                ]
+                self._call_conda(args, binary="cph")
+            except CondaException as e:
+                return (filename, dst_file, resulting_url, e)
+            return (filename, dst_file, resulting_url, None)
+
+        # Setup package_dirs which is where we look for existing packages.
         if use_package_dirs:
             package_dirs = self._package_dirs
-            for p in package_dirs:
-                with CondaLock(self._package_dir_lock_file(p)):
-                    url_file = os.path.join(p, "urls.txt")
-                    if os.path.isfile(url_file):
-                        with open(url_file, "rb") as f:
-                            known_urls.update([l.strip().decode("utf-8") for l in f])
         else:
             package_dirs = [tempdir]
 
+        # We are only adding to package_dirs[0] so we only read that one into known_urls
+        with CondaLock(self._package_dir_lock_file(package_dirs[0])):
+            url_file = os.path.join(package_dirs[0], "urls.txt")
+            if os.path.isfile(url_file):
+                with open(url_file, "rb") as f:
+                    known_urls.update([l.strip().decode("utf-8") for l in f])
+
+        # Iterate over all the filenames that we want to fetch.
         for filename, base_url, cache_url, file_hash in zip(
             filenames, urls, cache_urls, file_hashes
         ):
-            for p in [d for d in package_dirs if os.path.isdir(d)]:
-                path = os.path.join(p, filename)
-                extract_path = None
-                if not require_tarball:
-                    if filename.endswith(".tar.bz2"):
-                        extract_path = os.path.join(p, filename[:-8])
-                    elif filename.endswith(".conda"):
-                        extract_path = os.path.join(p, filename[:-5])
 
-                if extract_path and os.path.isdir(extract_path):
-                    print("Found directory: %s" % extract_path)
+            web_format = [f for f in CONDA_FORMATS if base_url.endswith(f)]
+            if len(web_format) != 1:
+                raise CondaException(
+                    "URL '%s' does not end with one of the expected formats (%s)"
+                    % (base_url, str(CONDA_FORMATS))
+                )
+            web_format = web_format[0]
+            have_files = {}
+            found_dir = False
+            # Look for it to exist in any of the package_dirs
+            for p in [d for d in package_dirs if os.path.isdir(d)]:
+                extract_path = os.path.join(p, filename)
+                if not require_format and os.path.isdir(extract_path):
+                    debug.conda_exec(
+                        "%s -> using existing directory %s" % (filename, extract_path)
+                    )
                     results.append(
                         LazyFetchResult(
                             filename=filename,
                             url=base_url,
-                            cache_url=cache_url,
-                            local_path=extract_path,
-                            fetched=False,
-                            cached=False,
                             is_dir=True,
+                            per_format_desc={
+                                ".local": {
+                                    "cache_url": None,
+                                    "local_path": extract_path,
+                                    "fetched": False,
+                                    "cached": False,
+                                    "transmuted": False,
+                                }
+                            },
                         )
                     )
+                    found_dir = True
                     break
-                elif os.path.isfile(path):
-                    print("Found file %s" % path)
-                    md5_hash = _get_md5_hash(path)
-                    if md5_hash == file_hash:
-                        results.append(
-                            LazyFetchResult(
-                                filename=filename,
-                                url=base_url,
-                                cache_url=cache_url,
-                                local_path=path,
-                                fetched=False,
-                                cached=False,
-                                is_dir=False,
-                            )
-                        )
-                        break
+                # At this point, we don't have a directory or we need specific tarballs
+                for f in CONDA_FORMATS:
+                    if f in have_files:
+                        continue
                     else:
-                        print(
-                            "Hash computed as %s -- expected %s" % (md5_hash, file_hash)
+                        tentative_path = os.path.join(p, "%s%s" % (filename, f))
+                        if os.path.isfile(tentative_path):
+                            expected_hash = file_hash.get(f)
+                            if (
+                                not expected_hash
+                                or get_md5_hash(tentative_path) == expected_hash
+                            ):
+                                have_files[f] = tentative_path
+                            else:
+                                debug.conda_exec(
+                                    "%s -> rejecting %s due to hash mismatch (expected %)"
+                                    % (
+                                        filename,
+                                        tentative_path,
+                                        expected_hash,
+                                    )
+                                )
+            if found_dir:
+                # We didn't need specific tarballs and we found a directory -- happy clam
+                continue
+
+            # This code extracts the most preferred source of filename as well as a list
+            # of where we can get a given format
+            # The most_preferred_source will be:
+            #  - if it exists, a local file (among local files, prefer CONDA_PREFERRED_FORMAT)
+            #  - if no local files, if they exist, a cached version
+            #    (among cached versions, prefer CONDA_PREFERRED_FORMAT)
+            #  - if no cached version, the web download
+            most_preferred_source = None
+            most_preferred_format = None
+            available_formats = {}
+            dl_local_path = os.path.join(package_dirs[0], "%s{format}" % filename)
+            # Check for local files first
+            for f in CONDA_FORMATS:
+                local_path = have_files.get(f)
+                if local_path:
+                    src = ("local", local_path, local_path)
+                    if most_preferred_source is None:
+                        most_preferred_source = src
+                        most_preferred_format = f
+                    available_formats[f] = src
+
+            # Check for cache paths next
+            for f in CONDA_FORMATS:
+                cache_path = cache_url.get(f)
+                if cache_path:
+                    src = ("cache", cache_path, dl_local_path.format(format=f))
+                    if most_preferred_source is None:
+                        most_preferred_source = src
+                        most_preferred_format = f
+                    if f not in available_formats:
+                        available_formats[f] = src
+
+            # And finally, fall back on the web
+            web_src = (
+                "web",
+                base_url,
+                dl_local_path.format(format=web_format),
+            )
+            if most_preferred_source is None:
+                most_preferred_source = web_src
+                most_preferred_format = web_format
+            if web_format not in available_formats:
+                available_formats[f] = web_src
+
+            debug.conda_exec(
+                "%s -> preferred %s @ %s:%s"
+                % (
+                    filename,
+                    most_preferred_format,
+                    most_preferred_source[0],
+                    most_preferred_source[1],
+                )
+            )
+
+            per_format_desc = {}
+            for f in require_format:
+                if f in available_formats:
+                    per_format_desc.update(
+                        _add_to_downloads_list_and_results(
+                            filename, f, *available_formats[f]
                         )
-            else:
-                # We need to download this file; check if it is a regular download
-                # or one from the cache
-                if base_url not in known_urls:
-                    # In some cases the url is in urls.txt but the package has been
-                    # cleaned up. In other words, urls.txt does not seem to be kept up
-                    # to date -- it's like an append only thing.
-                    url_adds.append("%s\n" % base_url)
-                if cache_url:
-                    cache_downloads.append(
-                        (cache_url, os.path.join(package_dirs[0], filename))
                     )
-                    results.append(
-                        LazyFetchResult(
-                            filename=filename,
-                            url=base_url,
-                            cache_url=cache_url,
-                            local_path=os.path.join(package_dirs[0], filename),
-                            fetched=True,
-                            cached=True,
-                            is_dir=False,
+            # If we didn't fetch anything -- add the most preferred format
+            if not per_format_desc:
+                per_format_desc.update(
+                    _add_to_downloads_list_and_results(
+                        filename, most_preferred_format, *most_preferred_source
+                    )
+                )
+
+            convert_from = next(iter(per_format_desc.values()))
+            for f in require_format:
+                if f not in per_format_desc:
+                    transmutes.append(
+                        (
+                            filename,
+                            f,
+                            convert_from["local_path"],
+                            dl_local_path.format(format=f),
+                            self._make_urlstxt_from_url(
+                                base_url, f, is_transmuted=True
+                            ),
                         )
                     )
-                else:
-                    web_downloads.append(
-                        (base_url, os.path.join(package_dirs[0], filename))
+                    per_format_desc.update(
+                        {
+                            f: {
+                                "cache_url": None,
+                                "local_path": dl_local_path.format(format=f),
+                                "fetched": False,
+                                "cached": False,
+                                "transmuted": True,
+                            }
+                        }
                     )
-                    results.append(
-                        LazyFetchResult(
-                            filename=filename,
-                            url=base_url,
-                            cache_url=cache_url,
-                            local_path=os.path.join(package_dirs[0], filename),
-                            fetched=True,
-                            cached=False,
-                            is_dir=False,
-                        )
-                    )
+
+            results.append(
+                LazyFetchResult(
+                    filename=filename,
+                    url=base_url,
+                    is_dir=False,
+                    per_format_desc=per_format_desc,
+                )
+            )
+
+        # Done going over all the files
         do_download = web_downloads or cache_downloads
         if do_download:
             start = time.time()
             self._echo(
-                "    Downloading %d(web) + %d(cache) packages out of %d  ..."
-                % (len(web_downloads), len(cache_downloads), len(filenames)),
+                "    Downloading %d(web) + %d(cache) packages ..."
+                % (len(web_downloads), len(cache_downloads)),
                 nl=False,
             )
 
@@ -358,122 +589,70 @@ class Conda(object):
         if do_download and not os.path.isdir(package_dirs[0]):
             os.makedirs(package_dirs[0])
 
-        # Could parallelize this again but unlikely to see a huge gain
+        pending_exceptions = []
         if web_downloads:
-            errors = [
-                r
-                for r in Pool().imap_unordered(_download_web, web_downloads)
-                if r is not None
-            ]
-            if errors:
-                raise CondaException("Error downloading packages: %s" % str(errors))
+            download_results = Pool().imap_unordered(_download_web, web_downloads)
+            for filename, src_url, error in download_results:
+                if error is not None:
+                    pending_exceptions.append(
+                        "Error downloading package for '%s': %s"
+                        % (filename, str(error))
+                    )
+                else:
+                    if src_url not in known_urls:
+                        url_adds.append(src_url)
 
         if cache_downloads:
             conda_package_root = get_conda_package_root(self._datastore_type)
             storage = DATASTORES[self._datastore_type](conda_package_root)
-            errors = []
             with storage.load_bytes([x[0] for x in cache_downloads]) as load_results:
-                for (key, tmpfile, _), local_file in zip(
-                    load_results, [x[1] for x in cache_downloads]
+                for (key, tmpfile, _), (filename, local_file) in zip(
+                    load_results, [x[1:] for x in cache_downloads]
                 ):
                     if not tmpfile:
-                        errors.append(key)
-                    shutil.move(tmpfile, local_file)
-            if errors:
-                raise CondaException(
-                    "Could not download the following cached packages (missing): %s"
-                    % str(errors)
-                )
+                        pending_exceptions.append(
+                            "Error downloading package from cache for '%s': not found at %s"
+                            % (filename, key)
+                        )
+                    else:
+                        url_to_add = self._make_urlstxt_from_cacheurl(key)
+                        if url_to_add not in known_urls:
+                            url_adds.append(url_to_add)
+                        shutil.move(tmpfile, local_file)
+
+        if do_download:
+            self._echo(" done in %d seconds." % int(time.time() - start))
+        if not pending_exceptions and transmutes:
+            start = time.time()
+            self._echo("    Transmuting %d packages ..." % len(transmutes), nl=False)
+            transmute_results = Pool().imap_unordered(_transmute, transmutes)
+            for filename, dst_file, resulting_url, error in transmute_results:
+                if error:
+                    pending_exceptions.append(
+                        "Error transmuting '%s' to '%s': %s"
+                        % (filename, dst_file, error)
+                    )
+                else:
+                    if resulting_url not in known_urls:
+                        url_adds.append(resulting_url)
+            self._echo(" done in %d seconds." % int(time.time() - start))
         if url_adds:
             # Update the urls file in the packages directory so that Conda knows that the
             # files are there
+            debug.conda_exec(
+                "Adding the following URLs to %s: %s"
+                % (os.path.join(package_dirs[0], "urls.txt"), str(url_adds))
+            )
             with CondaLock(self._package_dir_lock_file(package_dirs[0])):
                 with open(
                     os.path.join(package_dirs[0], "urls.txt"),
                     mode="a",
                     encoding="utf-8",
                 ) as f:
-                    f.writelines(url_adds)
-        if do_download:
-            self._echo("  done in %d seconds." % int(time.time() - start))
-        return results
+                    f.writelines(["%s\n" % l for l in url_adds])
+        if pending_exceptions:
+            raise CondaException("\n".join(pending_exceptions))
 
-    def transmute_packages(
-        self,
-        orig_paths,
-        orig_urls,
-        new_format=".conda",
-        replace_origs=False,
-        output_dir=None,
-    ):
-        # Transmute packages to new_format.
-        # - replace_origs: If True, replace old packages with the new ones and
-        #   update urls.txt if needed
-        # - output_dir: If set, use this directory for new packages. If not specified,
-        #   use the same directory.
-        # Returns a list of TransmuteResult
-        if new_format == ".conda":
-            old_format = ".tar.bz2"
-        else:
-            old_format = ".conda"
-
-        if "cph" not in self._bins:
-            raise CondaException(
-                "Cannot transmute packages without `cph`. "
-                "Please install using `%s install -n base conda-package-handling"
-                % self._dependency_solver
-            )
-
-        def _transmute(orig_path):
-            args = ["t", "--processes", "1", "--force", "--output-dir"]
-            old_name = os.path.basename(orig_path)
-            if not old_name.endswith(old_format):
-                return (
-                    orig_path,
-                    MetaflowInternalError(
-                        "Package %s does not end in %s" % (orig_path, old_format)
-                    ),
-                )
-            new_name = old_name[: -len(old_format)] + new_format
-            if output_dir:
-                args.append(output_dir)
-                new_path = os.path.join(output_dir, new_name)
-            else:
-                args.append(os.path.dirname(orig_path))
-                new_path = os.path.join(os.path.dirname(orig_path), old_name)
-            args.extend([orig_path, new_format])
-            try:
-                self._call_conda(args, binary="cph")
-            except CondaException as e:
-                return (orig_path, e)
-            else:
-                if replace_origs:
-                    os.unlink(orig_path)
-            return (orig_path, new_path)
-
-        if output_dir is not None and replace_origs:
-            raise MetaflowInternalError(
-                "Cannot specify an output_dir and replace_origs in transmute_packages"
-            )
-        transmute_results = Pool().imap_unordered(_transmute, orig_paths)
-        results = []
-        # TODO: Update urls.txt removing the old ones and adding the new ones.
-        for orig_path, result in transmute_results:
-            if isinstance(result, Exception):
-                results.append(
-                    TransmuteResult(
-                        orig_path=orig_path, new_path=None, new_hash=None, error=result
-                    )
-                )
-            else:
-                results.append(
-                    TransmuteResult(
-                        orig_path=orig_path,
-                        new_path=result,
-                        new_hash=_get_md5_hash(result),
-                        error=None,
-                    )
-                )
         return results
 
     def _resolve_conda_binary(self):
@@ -523,7 +702,7 @@ class Conda(object):
     def _install_local_conda(self):
         start = time.time()
         path = CONDA_LOCAL_PATH
-        self._echo("    Installing Conda environment at %s  ..." % path, nl=False)
+        self._echo("    Installing Conda environment at %s ..." % path, nl=False)
         shutil.rmtree(CONDA_LOCAL_PATH, ignore_errors=True)
 
         try:
@@ -556,7 +735,7 @@ class Conda(object):
                 raise InvalidEnvironmentException(
                     msg="Could not extract environment: %s" % str(e)
                 )
-        self._echo("  done in %d seconds." % int(time.time() - start), timestamp=False)
+        self._echo(" done in %d seconds." % int(time.time() - start), timestamp=False)
 
     def _resolve_remote_conda(self):
         if CONDA_REMOTE_INSTALLER is not None:
@@ -686,24 +865,71 @@ class Conda(object):
 
     def _create(self, env_id, env_desc):
         # We first get all the packages needed
-        cache_urls = env_desc.get("cache_urls", [None] * len(env_desc["urls"]))
-        self.lazy_fetch_packages(
-            env_desc["order"], env_desc["urls"], cache_urls, env_desc["hashes"]
+        cache_urls_per_format = env_desc.get(
+            "cache_urls_per_format", [{".conda": None}] * len(env_desc["urls"])
         )
+
+        override_urls = {}
+        fetch_results = self.lazy_fetch_packages(
+            env_desc["order"],
+            env_desc["urls"],
+            cache_urls_per_format,
+            env_desc["hashes_per_format"],
+        )
+        for r in fetch_results:
+            # If we are using a directory, we didn't download any tarball and we need
+            # to make sure we list the proper URL in the @EXPLICIT file so that it
+            # can use that one
+            if not r.is_dir:
+                continue
+            with open(
+                os.path.join(
+                    r.per_format_desc[".local"]["local_path"],
+                    "info",
+                    "repodata_record.json",
+                ),
+                mode="r",
+                encoding="utf-8",
+            ) as f:
+                info = json.load(f)
+                override_urls[r.url] = (info["url"], info["md5"])
         # At this point, we have all the packages that we need so we should be able to
         # just install directly
         start = time.time()
         self._echo("    Extracting and linking Conda environment ...", nl=False)
+        urls = []
+        hashes = []
+
+        for base_url, base_format, hash_info, cache_info in zip(
+            env_desc["urls"],
+            env_desc["url_formats"],
+            env_desc["hashes_per_format"],
+            cache_urls_per_format,
+        ):
+            if base_url in override_urls:
+                override_url, override_hash = override_urls[base_url]
+                urls.append(override_url)
+                hashes.append(override_hash)
+                continue
+            # If not override
+            potential_preferred = cache_info.get(CONDA_PREFERRED_FORMAT)
+            if potential_preferred:
+                cached_candidate = (CONDA_PREFERRED_FORMAT, potential_preferred)
+            else:
+                cached_candidate = next(iter(cache_info.items()))
+            if cached_candidate[1] is not None:
+                urls.append(self._make_urlstxt_from_cacheurl(cached_candidate[1]))
+                hashes.append(hash_info[cached_candidate[0]])
+            else:
+                urls.append(base_url)
+                hashes.append(hash_info[base_format])
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="ascii", delete=False
+            mode="w", encoding="utf-8", delete=False
         ) as explicit_list:
             # We create an explicit file
             lines = ["@EXPLICIT\n"]
             lines.extend(
-                [
-                    "%s#%s\n" % (base_url, file_hash)
-                    for base_url, file_hash in zip(env_desc["urls"], env_desc["hashes"])
-                ]
+                ["%s#%s\n" % (url, file_hash) for url, file_hash in zip(urls, hashes)]
             )
             explicit_list.writelines(lines)
             explicit_list.flush()
@@ -724,7 +950,7 @@ class Conda(object):
                 binary="micromamba" if "micromamba" in self._bins else "conda",
             )
         self._cached_info = None
-        self._echo("  done in %s seconds." % int(time.time() - start), timestamp=False)
+        self._echo(" done in %s seconds." % int(time.time() - start), timestamp=False)
 
     def _remove(self, env_id):
         self._call_conda(["env", "remove", "--name", env_id, "--yes", "--quiet"])
@@ -771,7 +997,7 @@ class Conda(object):
                 # NOTE: This is only if we typically have conda/mamba and are using
                 # micromamba. When micromamba is used by itself, we don't do this
                 args.extend(["-r", os.path.dirname(self._package_dirs[0])])
-            print("Calling %s" % str([self._bins[binary]] + args))
+            debug.conda_exec("Conda call: %s" % str([self._bins[binary]] + args))
             return subprocess.check_output(
                 [self._bins[binary]] + args,
                 stderr=subprocess.PIPE,

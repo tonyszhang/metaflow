@@ -10,7 +10,16 @@ from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
     BATCH_METADATA_SERVICE_HEADERS,
     BATCH_METADATA_SERVICE_URL,
+    CONDA_AZUREROOT,
     CONDA_DEPENDENCY_RESOLVER,
+    CONDA_LOCK_TIMEOUT,
+    CONDA_MAGIC_FILE,
+    CONDA_PACKAGE_AZUREROOT,
+    CONDA_PACKAGE_S3ROOT,
+    CONDA_PREFERRED_FORMAT,
+    CONDA_REMOTE_INSTALLER,
+    CONDA_REMOTE_INSTALLER_DIRNAME,
+    CONDA_S3ROOT,
     DATASTORE_CARD_S3ROOT,
     DATASTORE_SYSROOT_S3,
     DATATOOLS_S3ROOT,
@@ -765,7 +774,16 @@ class ArgoWorkflows(object):
                         "METAFLOW_DEFAULT_DATASTORE": self.flow_datastore.TYPE,
                         "METAFLOW_DEFAULT_METADATA": DEFAULT_METADATA,
                         "METAFLOW_CARD_S3ROOT": DATASTORE_CARD_S3ROOT,
-                        "METAFFLOW_CONDA_DEPENDENCY_RESOLVER": CONDA_DEPENDENCY_RESOLVER,
+                        "METAFLOW_CONDA_S3ROOT": CONDA_S3ROOT,
+                        "METAFLOW_CONDA_PACKAGE_S3ROOT": CONDA_PACKAGE_S3ROOT,
+                        "METAFLOW_CONDA_AZUREROOT": CONDA_AZUREROOT,
+                        "METAFLOW_CONDA_PACKAGE_AZUREROOT": CONDA_PACKAGE_AZUREROOT,
+                        "METAFLOW_CONDA_MAGIC_FILE": CONDA_MAGIC_FILE,
+                        "METAFLOW_CONDA_DEPENDENCY_RESOLVER": CONDA_DEPENDENCY_RESOLVER,
+                        "METAFLOW_CONDA_LOCK_TIMEOUT": str(CONDA_LOCK_TIMEOUT),
+                        "METAFLOW_CONDA_REMOTE_INSTALLER_DIRNAME": CONDA_REMOTE_INSTALLER_DIRNAME,
+                        "METAFLOW_CONDA_REMOTE_INSTALLER": CONDA_REMOTE_INSTALLER,
+                        "METAFLOW_CONDA_PREFERRED_FORMAT": CONDA_PREFERRED_FORMAT,
                         "METAFLOW_KUBERNETES_WORKLOAD": 1,
                         "METAFLOW_RUNTIME_ENVIRONMENT": "kubernetes",
                         "METAFLOW_OWNER": self.username,
@@ -785,6 +803,13 @@ class ArgoWorkflows(object):
                     **self.metadata.get_runtime_environment("argo-workflows"),
                 }
             )
+
+            # Transfer over any METAFLOW_DEBUG_ options
+            debug_flags = {
+                k: v for k, v in os.environ.items() if k.startswith("METAFLOW_DEBUG_")
+            }
+            for k, v in debug_flags.items():
+                env[k] = v
             # add METAFLOW_S3_ENDPOINT_URL
             env["METAFLOW_S3_ENDPOINT_URL"] = S3_ENDPOINT_URL
 

@@ -4,9 +4,12 @@ import json
 import fcntl
 import platform
 
+from hashlib import md5
+
 from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
     CONDA_MAGIC_FILE,
+    CONDA_PREFERRED_FORMAT,
     CONDA_S3ROOT,
     CONDA_PACKAGE_S3ROOT,
     CONDA_AZUREROOT,
@@ -14,6 +17,22 @@ from metaflow.metaflow_config import (
 )
 
 from metaflow.metaflow_environment import InvalidEnvironmentException
+
+_ALL_CONDA_FORMATS = (".tar.bz2", ".conda")
+# List of formats that guarantees the preferred format is first.
+CONDA_FORMATS = (
+    CONDA_PREFERRED_FORMAT,
+    *[x for x in _ALL_CONDA_FORMATS if x != CONDA_PREFERRED_FORMAT],
+)
+TRANSMUT_PATHCOMPONENT = "_transmut"
+
+
+def get_md5_hash(path):
+    md5_hash = md5()
+    with open(path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            md5_hash.update(byte_block)
+    return md5_hash.hexdigest()
 
 
 def get_conda_manifest_path(ds_root, flow_name):

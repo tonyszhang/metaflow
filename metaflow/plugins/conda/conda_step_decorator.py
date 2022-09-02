@@ -15,6 +15,7 @@ from metaflow.extension_support import EXT_PKG
 from metaflow.metadata import MetaDatum
 from metaflow.metaflow_config import (
     CONDA_FORCE_LINUX64,
+    CONDA_PREFERRED_FORMAT,
     get_pinned_conda_libs,
 )
 from metaflow.metaflow_environment import InvalidEnvironmentException
@@ -54,7 +55,13 @@ class CondaStepDecorator(StepDecorator):
     """
 
     name = "conda"
-    defaults = {"libraries": {}, "channels": [], "python": None, "disabled": None}
+    defaults = {
+        "libraries": {},
+        "channels": [],
+        "python": None,
+        "disabled": None,
+        "package_format": None,
+    }
 
     conda = None
     existing_environments = set()
@@ -112,6 +119,18 @@ class CondaStepDecorator(StepDecorator):
     @property
     def requested_architecture(self):
         return self._arch
+
+    @property
+    def package_format(self):
+        return next(
+            x
+            for x in [
+                self.attributes["package_format"],
+                self._base_attributes["package_format"],
+                CONDA_PREFERRED_FORMAT,
+            ]
+            if x is not None
+        )
 
     def step_init(self, flow, graph, step, decos, environment, flow_datastore, logger):
         if environment.TYPE != "conda":
