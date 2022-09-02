@@ -132,7 +132,9 @@ class CondaStepDecorator(StepDecorator):
             if x is not None
         )
 
-    def step_init(self, flow, graph, step, decos, environment, flow_datastore, logger):
+    def step_init(
+        self, flow, graph, step_name, decorators, environment, flow_datastore, logger
+    ):
         if environment.TYPE != "conda":
             raise InvalidEnvironmentException(
                 "The *@conda* decorator requires " "--environment=conda"
@@ -140,9 +142,9 @@ class CondaStepDecorator(StepDecorator):
 
         self._echo = logger
         self._env = environment
-        self._arch = self._architecture(decos)
+        self._arch = self._architecture(decorators)
         self._flow = flow
-        self._step_name = step
+        self._step_name = step_name
         self._flow_datastore_type = flow_datastore.TYPE
         self._base_attributes = self._get_base_attributes()
 
@@ -228,6 +230,7 @@ class CondaStepDecorator(StepDecorator):
                     my_env_id
                 ]
                 self.conda.create(self._step_name, self.env_id, env_desc)
+                self.existing_environments = self.conda.environments(self._flow.name)
 
             # Actually set it up.
             python_path = self._metaflow_home

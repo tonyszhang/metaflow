@@ -1,33 +1,23 @@
-from collections import defaultdict
-from hashlib import md5
-from itertools import chain
 import json
 import os
 import time
-import requests
-import shutil
-import sys
 import tarfile
-
-from hashlib import md5
-from io import BytesIO
-from multiprocessing.dummy import Pool
 import tempfile
-from metaflow.datastore import DATASTORES
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
+
+from metaflow.datastore import DATASTORES
 from metaflow.datastore.local_storage import LocalStorage
 from metaflow.debug import debug
 
 from metaflow.metaflow_config import CONDA_MAGIC_FILE
 from metaflow.metaflow_environment import MetaflowEnvironment
-from metaflow.exception import MetaflowException
-from metaflow.mflog import BASH_SAVE_LOGS
 
 from .conda_step_decorator import CondaStepDecorator
 from .conda import Conda, CondaException
 from . import (
     CONDA_FORMATS,
-    arch_id,
     get_conda_manifest_path,
     get_conda_package_root,
     get_md5_hash,
@@ -193,49 +183,54 @@ class CondaEnvironment(MetaflowEnvironment):
             )
 
         if len(env_ids):
-            explicit_deps = Pool().imap_unordered(
-                _resolve, [v for k, v in self._requested_envs.items() if k in env_ids]
-            )
-            for env_id, deps in explicit_deps:
-                urls = []
-                hashes = []
-                filenames = []
-                url_formats = []
-                for d in deps:
-                    s = d.split("#")
-                    urls.append(s[0])
+            with ThreadPoolExecutor() as executor:
+                resolution_result = [
+                    executor.submit(_resolve, v)
+                    for k, v in self._requested_envs.items()
+                    if k in env_ids
+                ]
+                for f in as_completed(resolution_result):
+                    env_id, deps = f.result()
+                    urls = []
+                    hashes = []
+                    filenames = []
+                    url_formats = []
+                    for d in deps:
+                        s = d.split("#")
+                        urls.append(s[0])
 
-                    filename = os.path.split(urlparse(s[0]).path)[1]
-                    for f in CONDA_FORMATS:
-                        if filename.endswith(f):
-                            hashes.append({f: s[1]})
-                            filenames.append(filename[: -len(f)])
-                            url_formats.append(f)
-                            break
-                    else:
-                        raise CondaException(
-                            "URL '%s' is not a supported format (%s)"
-                            % (s[0], CONDA_FORMATS)
-                        )
+                        filename = os.path.split(urlparse(s[0]).path)[1]
+                        for f in CONDA_FORMATS:
+                            if filename.endswith(f):
+                                hashes.append({f: s[1]})
+                                filenames.append(filename[: -len(f)])
+                                url_formats.append(f)
+                                break
+                        else:
+                            raise CondaException(
+                                "URL '%s' is not a supported format (%s)"
+                                % (s[0], CONDA_FORMATS)
+                            )
 
-                payload = {
-                    "deps": [
-                        d.decode("ascii") for d in self._requested_envs[env_id]["deps"]
-                    ],
-                    "channels": [
-                        c.decode("ascii")
-                        for c in self._requested_envs[env_id]["channels"]
-                    ],
-                    "order": filenames,
-                    "url_formats": url_formats,
-                    "urls": urls,
-                    "hashes_per_format": hashes,
-                }
-                debug.conda_exec(
-                    "For environment %s (deps: %s), need packages %s"
-                    % (env_id, str(payload["deps"]), str(payload["order"]))
-                )
-                self._cached_deps[env_id] = payload
+                    payload = {
+                        "deps": [
+                            d.decode("ascii")
+                            for d in self._requested_envs[env_id]["deps"]
+                        ],
+                        "channels": [
+                            c.decode("ascii")
+                            for c in self._requested_envs[env_id]["channels"]
+                        ],
+                        "order": filenames,
+                        "url_formats": url_formats,
+                        "urls": urls,
+                        "hashes_per_format": hashes,
+                    }
+                    debug.conda_exec(
+                        "For environment %s (deps: %s), need packages %s"
+                        % (env_id, str(payload["deps"]), str(payload["order"]))
+                    )
+                    self._cached_deps[env_id] = payload
         duration = int(time.time() - start)
         echo(" done in %d seconds." % duration)
 
@@ -489,7 +484,7 @@ class CondaEnvironment(MetaflowEnvironment):
                     nl=False,
                 )
                 storage.save_bytes(paths_and_handles(), len_hint=len(upload_files))
-                echo(" done in %d seconds." % int(time.time() - start), nl=False)
+                echo(" done in %d seconds." % int(time.time() - start))
             else:
                 echo("    All packages cached in %s." % self._flow_datastore_type)
 

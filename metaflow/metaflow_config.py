@@ -344,7 +344,11 @@ CONDA_MAGIC_FILE = from_conf("METAFLOW_CONDA_MAGIC_FILE", "conda.dependencies")
 # Use an alternate dependency resolver for conda packages instead of conda
 # Mamba promises faster package dependency resolution times, which
 # should result in an appreciable speedup in flow environment initialization.
-CONDA_DEPENDENCY_RESOLVER = from_conf("METAFLOW_CONDA_DEPENDENCY_RESOLVER", "conda")
+CONDA_DEPENDENCY_RESOLVER = from_conf(
+    "METAFLOW_CONDA_DEPENDENCY_RESOLVER",
+    "conda",
+    _get_validate_choice_fn(["mamba", "conda"]),
+)
 
 # Timeout trying to acquire the lock to create environments
 CONDA_LOCK_TIMEOUT = int(from_conf("METAFLOW_CONDA_LOCK_TIMEOUT", "3600"))
@@ -376,6 +380,13 @@ CONDA_PREFERRED_FORMAT = from_conf(
     "METAFLOW_CONDA_PREFERRED_FORMAT",
     ".tar.bz2",
     _get_validate_choice_fn([".tar.bz2", ".conda"]),
+)
+
+# Conda or conda-lock to resolve env
+CONDA_PREFERRED_RESOLVER = from_conf(
+    "METAFLOW_CONDA_PREFERRED_RESOLVER",
+    "conda",
+    _get_validate_choice_fn(["conda", "conda-lock"]),
 )
 # HACK
 CONDA_FORCE_LINUX64 = ("batch", "kubernetes")

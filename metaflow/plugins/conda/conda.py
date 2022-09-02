@@ -1,10 +1,6 @@
 import errno
-from hashlib import md5
-from multiprocessing.dummy import Pool
-import os
 import json
-import typing
-import requests
+import os
 import shutil
 import stat
 import subprocess
@@ -13,9 +9,10 @@ import tempfile
 import time
 
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from distutils.version import LooseVersion
-
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from metaflow.datastore import DATASTORES
 from metaflow.debug import debug
@@ -26,6 +23,7 @@ from metaflow.metaflow_config import (
     CONDA_LOCAL_DIST,
     CONDA_LOCAL_PATH,
     CONDA_LOCK_TIMEOUT,
+    CONDA_PREFERRED_RESOLVER,
     CONDA_REMOTE_INSTALLER,
     CONDA_REMOTE_INSTALLER_DIRNAME,
     CONDA_PREFERRED_FORMAT,
@@ -65,43 +63,7 @@ class CondaStepException(CondaException):
 
 
 class Conda(object):
-    @staticmethod
-    def _convert_filepath(path, file_format=None):
-        if file_format and not path.endswith(file_format):
-            for f in CONDA_FORMATS:
-                if path.endswith(f):
-                    path = path[: -len(f)] + file_format
-                    break
-            else:
-                raise CondaException(
-                    "URL '%s' does not end with a supported file format %s"
-                    % (path, str(CONDA_FORMATS))
-                )
-        return os.path.split(path)
-
-    def _make_urlstxt_from_url(self, base_url, file_format=None, is_transmuted=False):
-        if not is_transmuted:
-            return base_url
-        url = urlparse(base_url)
-        file_path, filename = Conda._convert_filepath(url.path, file_format)
-        return os.path.join(
-            get_conda_package_root(self._datastore_type),
-            TRANSMUT_PATHCOMPONENT,
-            url.netloc,
-            file_path.lstrip("/"),
-            filename,
-        )
-
-    def _make_urlstxt_from_cacheurl(self, cache_url):
-        if TRANSMUT_PATHCOMPONENT in cache_url:
-            return os.path.join(
-                get_conda_package_root(self._datastore_type),
-                os.path.split(os.path.split(cache_url)[0])[
-                    0
-                ],  # Strip off last two (hash and filename)
-            )
-        else:
-            return "https://" + os.path.split(os.path.split(cache_url)[0])[0]
+    _cached_info = None
 
     @staticmethod
     def make_cache_url(base_url, file_hash, file_format=None, is_transmuted=False):
@@ -158,73 +120,27 @@ class Conda(object):
         else:
             self._echo = echo
 
-        self._cached_info = None
         self._datastore_type = datastore_type
         self._mode = mode
         self._bins = self._dependency_solver = None
         self._have_micromamba = False  # True if the installer is micromamba
+        self._use_conda_lock_to_resolve = CONDA_PREFERRED_RESOLVER == "conda-lock"
         self._resolve_conda_binary()
 
     def resolve(self, using_steps, env_id, deps, channels, architecture):
         if self._mode != "local":
-            # TODO: This will change and we will need to "upgrade" if needed but for
-            # now, we just punt on resolving an environment remotely -- it should already
-            # have been resolved.
+            # TODO: Maybe relax this later but for now assume that the remote environment
+            # is a "lighter" conda.
             raise CondaException("Cannot resolve environments in a remote environment")
 
         try:
-            # We resolve the environment using conda-lock
-
-            # Write out the requirement yml file. It's easy enough so don't use a YAML
-            # library to avoid adding another dep
-
-            # Add channels
-            lines = ["channels:\n"]
-            lines.extend(["  - %s" % c for c in channels])
-            lines.append("  - conda-forge\n")
-
-            # Add deps
-            lines.append("dependencies:\n")
-            lines.extend(["  - %s\n" % d.decode("ascii") for d in deps])
-
-            with tempfile.NamedTemporaryFile(mode="w", encoding="ascii") as input_yml:
-                input_yml.writelines(lines)
-                input_yml.flush()
-                args = [
-                    "lock",
-                    "-f",
-                    input_yml.name,
-                    "-p",
-                    architecture,
-                    "--filename-template",
-                    "conda-lock-gen-%s-{platform}" % env_id,
-                    "-k",
-                    "explicit",
-                    "--conda",
-                    self._bins.get("micromamba", self._bins["conda"]),
-                ]
-                if "micromamba" in self._bins:
-                    args.append("--micromamba")
-                elif self._dependency_solver == "mamba":
-                    args.append("--mamba")
-                self._call_conda(args, binary="conda-lock")
-            # At this point, we need to read the explicit dependencies in the file created
-            emit = False
-            result = []
-            with open(
-                "conda-lock-gen-%s-%s" % (env_id, architecture), "r", encoding="utf-8"
-            ) as out:
-                for l in out:
-                    if emit:
-                        result.append(l.strip())
-                    if not emit and l.strip() == "@EXPLICIT":
-                        emit = True
-            return result
+            if self._use_conda_lock_to_resolve:
+                return self._resolve_env_with_conda_lock(
+                    env_id, deps, channels, architecture
+                )
+            return self._resolve_env_with_conda(env_id, deps, channels, architecture)
         except CondaException as e:
             raise CondaStepException(e, using_steps)
-        finally:
-            if os.path.isfile("conda-lock-gen-%s-%s" % (env_id, architecture)):
-                os.unlink("conda-lock-gen-%s-%s" % (env_id, architecture))
 
     def create(self, step_name, env_id, env_desc, do_symlink=False):
         # env_desc is a DS that is stored in the CONDA_MAGIC_FILE and contains the
@@ -363,10 +279,10 @@ class Conda(object):
             filename, url, local_path = entry
             debug.conda_exec("%s -> download %s to %s" % (filename, url, local_path))
             try:
-                with requests.get(url, stream=True) as r:
+                with urlopen(url) as r:
                     with open(local_path, "wb") as f:
                         # TODO: We could check the hash here
-                        shutil.copyfileobj(r.raw, f)
+                        shutil.copyfileobj(r, f)
             except Exception as e:
                 return (filename, url, e)
             return (filename, url, None)
@@ -377,17 +293,19 @@ class Conda(object):
                 "%s -> transmute %s to %s" % (filename, src_file, dst_file)
             )
             try:
-                args = [
-                    "t",
-                    "--processes",
-                    "1",
-                    "--force",
-                    "--out-folder",
-                    os.path.dirname(dst_file),
-                    src_file,
-                    new_format,
-                ]
-                self._call_conda(args, binary="cph")
+                # args = [
+                #     "t",
+                #     "--processes",
+                #     "1",
+                #     "--force",
+                #     "--out-folder",
+                #     os.path.dirname(dst_file),
+                #     src_file,
+                #     new_format,
+                # ]
+                # self._call_conda(args, binary="cph")
+                args = ["package", "transmute", "-c", "3", src_file]
+                self._call_conda(args, binary="micromamba")
             except CondaException as e:
                 return (filename, dst_file, resulting_url, e)
             return (filename, dst_file, resulting_url, None)
@@ -459,7 +377,7 @@ class Conda(object):
                                 have_files[f] = tentative_path
                             else:
                                 debug.conda_exec(
-                                    "%s -> rejecting %s due to hash mismatch (expected %)"
+                                    "%s -> rejecting %s due to hash mismatch (expected %s)"
                                     % (
                                         filename,
                                         tentative_path,
@@ -591,16 +509,20 @@ class Conda(object):
 
         pending_exceptions = []
         if web_downloads:
-            download_results = Pool().imap_unordered(_download_web, web_downloads)
-            for filename, src_url, error in download_results:
-                if error is not None:
-                    pending_exceptions.append(
-                        "Error downloading package for '%s': %s"
-                        % (filename, str(error))
-                    )
-                else:
-                    if src_url not in known_urls:
-                        url_adds.append(src_url)
+            with ThreadPoolExecutor() as executor:
+                download_results = [
+                    executor.submit(_download_web, entry) for entry in web_downloads
+                ]
+                for f in as_completed(download_results):
+                    filename, src_url, error = f.result()
+                    if error is not None:
+                        pending_exceptions.append(
+                            "Error downloading package for '%s': %s"
+                            % (filename, str(error))
+                        )
+                    else:
+                        if src_url not in known_urls:
+                            url_adds.append(src_url)
 
         if cache_downloads:
             conda_package_root = get_conda_package_root(self._datastore_type)
@@ -621,21 +543,29 @@ class Conda(object):
                         shutil.move(tmpfile, local_file)
 
         if do_download:
-            self._echo(" done in %d seconds." % int(time.time() - start))
+            self._echo(
+                " done in %d seconds." % int(time.time() - start), timestamp=False
+            )
         if not pending_exceptions and transmutes:
             start = time.time()
             self._echo("    Transmuting %d packages ..." % len(transmutes), nl=False)
-            transmute_results = Pool().imap_unordered(_transmute, transmutes)
-            for filename, dst_file, resulting_url, error in transmute_results:
-                if error:
-                    pending_exceptions.append(
-                        "Error transmuting '%s' to '%s': %s"
-                        % (filename, dst_file, error)
-                    )
-                else:
-                    if resulting_url not in known_urls:
-                        url_adds.append(resulting_url)
-            self._echo(" done in %d seconds." % int(time.time() - start))
+            with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+                transmut_results = [
+                    executor.submit(_transmute, entry) for entry in transmutes
+                ]
+                for f in as_completed(transmut_results):
+                    filename, dst_file, resulting_url, error = f.result()
+                    if error:
+                        pending_exceptions.append(
+                            "Error transmuting '%s' to '%s': %s"
+                            % (filename, dst_file, error)
+                        )
+                    else:
+                        if resulting_url not in known_urls:
+                            url_adds.append(resulting_url)
+            self._echo(
+                " done in %d seconds." % int(time.time() - start), timestamp=False
+            )
         if url_adds:
             # Update the urls file in the packages directory so that Conda knows that the
             # files are there
@@ -654,6 +584,133 @@ class Conda(object):
             raise CondaException("\n".join(pending_exceptions))
 
         return results
+
+    def _resolve_env_with_conda(self, env_id, deps, channels, architecture):
+        result = []
+        with tempfile.TemporaryDirectory() as mamba_dir:
+            args = [
+                "create",
+                "--prefix",
+                os.path.join(mamba_dir, "prefix"),
+                "--dry-run",
+            ]
+            for c in channels:
+                args.extend(["-c", c])
+
+            args.extend(deps)
+
+            addl_env = {
+                "CONDA_SUBDIR": architecture,
+                "CONDA_PKGS_DIRS": mamba_dir,
+                "CONDA_ROOT": self._info["root_prefix"],
+                "CONDA_UNSATISFIABLE_HINTS_CHECK_DEPTH": "0",
+            }
+            conda_result = json.loads(self._call_conda(args, addl_env=addl_env))
+
+        # This returns a JSON blob with:
+        #  - actions:
+        #    - FETCH: List of objects to fetch -- this is where we get hash and URL
+        #    - LINK: Packages to actually install (in that order)
+        if not conda_result["success"]:
+            raise CondaException(
+                "Could not resolve environment: %s" % str(conda_result)
+            )
+
+        def _pkg_key(name, platform, build_string, build_number):
+            return "%s_%s_%s_%s" % (name, platform, build_string, build_number)
+
+        fetched_packages = {}
+        for pkg in conda_result["actions"]["FETCH"]:
+            fetched_packages[
+                _pkg_key(pkg["name"], pkg["subdir"], pkg["build"], pkg["build_number"])
+            ] = (pkg["url"], pkg["md5"])
+        for lnk in conda_result["actions"]["LINK"]:
+            k = _pkg_key(
+                lnk["name"],
+                lnk["platform"],
+                lnk["build_string"],
+                lnk["build_number"],
+            )
+            url, md5_hash = fetched_packages[k]
+            if not url.startswith(lnk["base_url"]):
+                raise CondaException(
+                    "Unexpected record for %s: %s" % (k, str(conda_result))
+                )
+            result.append("%s#%s" % (url, md5_hash))
+        return result
+
+    def _resolve_env_with_conda_lock(self, env_id, deps, channels, architecture):
+        try:
+            # We resolve the environment using conda-lock
+
+            # Write out the requirement yml file. It's easy enough so don't use a YAML
+            # library to avoid adding another dep
+
+            # Add channels
+            lines = ["channels:\n"]
+            lines.extend(["  - %s" % c for c in channels])
+            lines.append("  - conda-forge\n")
+
+            # Add deps
+            lines.append("dependencies:\n")
+            lines.extend(["  - %s\n" % d.decode("ascii") for d in deps])
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="ascii", delete=False
+            ) as input_yml:
+                input_yml.writelines(lines)
+                input_yml.flush()
+                args = [
+                    "lock",
+                    "-f",
+                    input_yml.name,
+                    "-p",
+                    architecture,
+                    "--filename-template",
+                    "conda-lock-gen-%s-{platform}" % env_id,
+                    "-k",
+                    "explicit",
+                    "--conda",
+                    self._bins["conda"],
+                ]
+                if self._dependency_solver == "mamba":
+                    args.append("--mamba")
+
+                # If arch_id() == architecture, we also use the same virtual packages
+                # as the ones that exist on the machine to mimic the current behavior
+                # of conda/mamba
+                if arch_id() == architecture:
+                    lines = ["subdirs:\n", "  %s:\n" % architecture, "    packages:\n"]
+                    virtual_pkgs = self._info["virtual_pkgs"]
+                    lines.extend(
+                        [
+                            "      %s: %s-%s\n" % (pkg_name, pkg_version, pkg_id)
+                            for pkg_name, pkg_version, pkg_id in virtual_pkgs
+                        ]
+                    )
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="ascii", delete=False
+                    ) as virtual_yml:
+                        virtual_yml.writelines(lines)
+                        virtual_yml.flush()
+                        args.extend(["--virtual-package-spec", virtual_yml.name])
+
+                        self._call_conda(args, binary="conda-lock")
+            # At this point, we need to read the explicit dependencies in the file created
+            emit = False
+            result = []
+            with open(
+                "conda-lock-gen-%s-%s" % (env_id, architecture), "r", encoding="utf-8"
+            ) as out:
+                for l in out:
+                    if emit:
+                        result.append(l.strip())
+                    if not emit and l.strip() == "@EXPLICIT":
+                        emit = True
+            return result
+        finally:
+            if os.path.isfile("conda-lock-gen-%s-%s" % (env_id, architecture)):
+                os.unlink("conda-lock-gen-%s-%s" % (env_id, architecture))
 
     def _resolve_conda_binary(self):
         self._dependency_solver = CONDA_DEPENDENCY_RESOLVER.lower()
@@ -801,6 +858,14 @@ class Conda(object):
                 elif k in ("micromamba", "cph"):
                     # This is an optional install so we ignore if not present
                     to_remove.append(k)
+                elif k in ("conda-lock",):
+                    if self._use_conda_lock_to_resolve:
+                        self._use_conda_lock_to_resolve = False
+                        self._echo(
+                            "Falling back to '%s' to resolve as conda-lock not installed"
+                            % (self._dependency_solver)
+                        )
+                    to_remove.append(k)
                 else:
                     return InvalidEnvironmentException(
                         "Required binary '%s' found. Install using `%s install -n base %s`"
@@ -813,7 +878,7 @@ class Conda(object):
         if "micromamba version" in self._info:
             self._have_micromamba = True
             if LooseVersion(self._info["micromamba version"]) < LooseVersion("0.25.1"):
-                msg = "Microconda version 0.25.1 or newer is required."
+                msg = "Micromamba version 0.25.1 or newer is required."
                 return InvalidEnvironmentException(msg)
         elif self._dependency_solver == "conda" or self._dependency_solver == "mamba":
             if LooseVersion(self._info["conda_version"]) < LooseVersion("4.6.0"):
@@ -980,23 +1045,64 @@ class Conda(object):
     def _package_dir_lock_file(self, dir):
         return os.path.join(dir, "mf_pkgs-update.lock")
 
-    def _call_conda(
-        self, args, binary="conda", architecture=None, disable_safety_checks=False
-    ):
+    @staticmethod
+    def _convert_filepath(path, file_format=None):
+        if file_format and not path.endswith(file_format):
+            for f in CONDA_FORMATS:
+                if path.endswith(f):
+                    path = path[: -len(f)] + file_format
+                    break
+            else:
+                raise CondaException(
+                    "URL '%s' does not end with a supported file format %s"
+                    % (path, str(CONDA_FORMATS))
+                )
+        return os.path.split(path)
+
+    def _make_urlstxt_from_url(self, base_url, file_format=None, is_transmuted=False):
+        if not is_transmuted:
+            return base_url
+        url = urlparse(base_url)
+        file_path, filename = Conda._convert_filepath(url.path, file_format)
+        return os.path.join(
+            get_conda_package_root(self._datastore_type),
+            TRANSMUT_PATHCOMPONENT,
+            url.netloc,
+            file_path.lstrip("/"),
+            filename,
+        )
+
+    def _make_urlstxt_from_cacheurl(self, cache_url):
+        if TRANSMUT_PATHCOMPONENT in cache_url:
+            return os.path.join(
+                get_conda_package_root(self._datastore_type),
+                os.path.split(os.path.split(cache_url)[0])[
+                    0
+                ],  # Strip off last two (hash and filename)
+            )
+        else:
+            return "https://" + os.path.split(os.path.split(cache_url)[0])[0]
+
+    def _call_conda(self, args, binary="conda", addl_env=None):
         try:
             env = {
                 "CONDA_JSON": "True",
-                "CONDA_SUBDIR": (architecture if architecture else ""),
                 "MAMBA_NO_BANNER": "1",
                 "MAMBA_JSON": "True",
             }
-            if disable_safety_checks:
-                env["CONDA_SAFETY_CHECKS"] = "disabled"
-            if binary == "micromamba":
-                # Add a few options to make sure it plays well with conda/mamba
-                # NOTE: This is only if we typically have conda/mamba and are using
-                # micromamba. When micromamba is used by itself, we don't do this
-                args.extend(["-r", os.path.dirname(self._package_dirs[0])])
+            if addl_env:
+                env.update(addl_env)
+
+            if args and args[0] != "package":
+                if binary == "micromamba":
+                    # Add a few options to make sure it plays well with conda/mamba
+                    # NOTE: This is only if we typically have conda/mamba and are using
+                    # micromamba. When micromamba is used by itself, we don't do this
+                    args.extend(["-r", os.path.dirname(self._package_dirs[0])])
+                if binary == "micromamba" or self._have_micromamba:
+                    # Both if we are using micromamba standalone or using micromamba instead of
+                    # conda/mamba: no env-var like MAMBA_JSON.
+                    args.append("--json")
             debug.conda_exec("Conda call: %s" % str([self._bins[binary]] + args))
             return subprocess.check_output(
                 [self._bins[binary]] + args,
