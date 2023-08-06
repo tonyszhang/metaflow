@@ -44,6 +44,8 @@ STEP_DECORATORS_DESC = [
     ("conda", ".conda.conda_step_decorator.CondaStepDecorator"),
     ("card", ".cards.card_decorator.CardDecorator"),
     ("pytorch_parallel", ".frameworks.pytorch.PytorchParallelDecorator"),
+    ("tensorflow_parallel", ".frameworks.tensorflow.TensorflowParallelDecorator"),
+    ("ray_parallel", ".frameworks.ray.RayParallelDecorator"),
     ("airflow_internal", ".airflow.airflow_decorator.AirflowInternalDecorator"),
 ]
 

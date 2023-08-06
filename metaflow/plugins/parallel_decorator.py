@@ -127,3 +127,30 @@ def _local_multinode_control_task_step_func(flow, env_to_use, step_func, retry_c
         p.wait()
         if p.returncode:
             raise Exception("Subprocess failed, return code {}".format(p.returncode))
+
+
+def identify_previous_task_pathspec(graph_info, current):
+
+    """
+    Find the pathspec of the control task that a mapper task is part of. 
+    """
+
+    from metaflow import Step
+
+    steps_info = graph_info['steps']
+    for step_name, step_info in steps_info.items():
+        if current.step_name in step_name:
+            previous_step_name = step_name
+            step_pathspec = "{flow_name}/{run_id}/{step_name}".format(
+                flow_name=current.flow_name,
+                run_id=current.run_id,
+                step_name=previous_step_name
+            )
+            step = Step(step_pathspec)
+            for task in step:
+                if task.id.startswith("control"):
+                    control_task_pathspec = "{step_pathspec}/{task_id}".format(
+                        step_pathspec=step.pathspec,
+                        task_id=task.id
+                    )
+                    return control_task_pathspec
