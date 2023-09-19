@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import time
+import copy
 from typing import Dict, List, Optional
 
 from metaflow import current, util
@@ -168,6 +169,9 @@ class Kubernetes(object):
         persistent_volume_claims=None,
         tolerations=None,
         labels=None,
+        annotations=None,
+        num_parallel=0, 
+        attrs={}, 
     ):
         if env is None:
             env = {}
@@ -207,6 +211,8 @@ class Kubernetes(object):
                 tmpfs_size=tmpfs_size,
                 tmpfs_path=tmpfs_path,
                 persistent_volume_claims=persistent_volume_claims,
+                num_parallel=num_parallel,  
+                attrs=attrs,
             )
             .environment_variable("METAFLOW_CODE_SHA", code_package_sha)
             .environment_variable("METAFLOW_CODE_URL", code_package_url)
@@ -258,6 +264,7 @@ class Kubernetes(object):
             # pod; this happens when METAFLOW_DATASTORE_SYSROOT_LOCAL is NOT set (
             # see get_datastore_root_from_config in datastore/local.py).
         )
+        self.num_parallel = num_parallel
 
         if S3_SERVER_SIDE_ENCRYPTION is not None:
             job.environment_variable(
@@ -324,7 +331,7 @@ class Kubernetes(object):
             sigmoid = 1.0 / (1.0 + math.exp(-0.01 * secs_since_start + 9.0))
             return 0.5 + sigmoid * 30.0
 
-        def wait_for_launch(job):
+        def wait_for_launch(job, child_jobs):
             status = job.status
             echo(
                 "Task is starting (%s)..." % status,
@@ -334,11 +341,38 @@ class Kubernetes(object):
             t = time.time()
             start_time = time.time()
             while job.is_waiting:
-                new_status = job.status
-                if status != new_status or (time.time() - t) > 30:
-                    status = new_status
+                # new_status = job.status
+                if status != job.status or (time.time() - t) > 30:
+                    if not child_jobs:
+                        child_statuses = ""
+                    else:
+                        status_keys = set(
+                            [child_job.status for child_job in child_jobs]
+                        )
+                        status_counts = [
+                            (
+                                status,
+                                len(
+                                    [
+                                        child_job.status == status
+                                        for child_job in child_jobs
+                                    ]
+                                ),
+                            )
+                            for status in status_keys
+                        ]
+                        child_statuses = " (parallel node status: [{}])".format(
+                            ", ".join(
+                                [
+                                    "{}:{}".format(status, num)
+                                    for (status, num) in sorted(status_counts)
+                                ]
+                            )
+                        )
+
+                    status = job.status
                     echo(
-                        "Task is starting (%s)..." % status,
+                        "Task is starting (status %s)... %s" % (status, child_statuses),
                         "stderr",
                         job_id=job.id,
                     )
@@ -350,8 +384,16 @@ class Kubernetes(object):
         stdout_tail = get_log_tailer(stdout_location, self._datastore.TYPE)
         stderr_tail = get_log_tailer(stderr_location, self._datastore.TYPE)
 
+        child_jobs = []
+        # TODO (eddie) figure out right way to do this
+        # if self.num_parallel > 1:
+        #     for node in range(1, self.num_parallel):
+        #         child_job = copy.copy(self.job)
+        #         child_job._id = child_job._id + "#{}".format(node)
+        #         child_jobs.append(child_job)
+
         # 1) Loop until the job has started
-        wait_for_launch(self._job)
+        wait_for_launch(self._job, child_jobs)
 
         # 2) Tail logs until the job has finished
         tail_logs(
