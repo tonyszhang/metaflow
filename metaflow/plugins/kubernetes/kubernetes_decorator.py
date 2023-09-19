@@ -2,6 +2,9 @@ import json
 import os
 import platform
 import sys
+import re
+from typing import Optional, Dict
+import time
 
 from metaflow import current
 from metaflow.decorators import StepDecorator
@@ -24,6 +27,7 @@ from metaflow.metaflow_config import (
 from metaflow.plugins.resources_decorator import ResourcesDecorator
 from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
 from metaflow.sidecar import Sidecar
+from metaflow.unbounded_foreach import UBF_CONTROL
 
 from ..aws.aws_utils import get_docker_registry, get_ec2_instance_metadata
 from .kubernetes import KubernetesException, parse_kube_keyvalue_list
@@ -207,11 +211,10 @@ class KubernetesDecorator(StepDecorator):
                 "Kubernetes. Please use one or the other.".format(step=step)
             )
 
-        for deco in decos:
-            if getattr(deco, "IS_PARALLEL", False):
-                raise KubernetesException(
-                    "@kubernetes does not support parallel execution currently."
-                )
+        # account for control task and increment rank of all other tasks
+        if any(getattr(deco, "IS_PARALLEL", False) for deco in decos) and not ubf_context == UBF_CONTROL:
+            worker_job_rank = int(os.environ["RANK"])
+            os.environ["RANK"] = str(worker_job_rank + 1)
 
         # Set run time limit for the Kubernetes job.
         self.run_time_limit = get_run_time_limit_for_task(decos)
@@ -410,6 +413,23 @@ class KubernetesDecorator(StepDecorator):
             self._save_logs_sidecar = Sidecar("save_logs_periodically")
             self._save_logs_sidecar.start()
 
+        num_parallel = int(os.environ.get("WORLD_SIZE", 0))
+        if num_parallel >= 1 and ubf_context == UBF_CONTROL:
+            control_task_id = current.task_id
+            top_task_id = control_task_id.replace("control-", "")
+            mapper_task_ids = [control_task_id] + [
+                "%s-node-%d" % (top_task_id, node_idx)
+                for node_idx in range(1, num_parallel)
+            ]
+            flow._control_mapper_tasks = [
+                "%s/%s/%s" % (run_id, step_name, mapper_task_id)
+                for mapper_task_id in mapper_task_ids
+            ]
+            flow._control_task_is_mapper_zero = True
+
+        if num_parallel >= 1:
+            _setup_multinode_environment()
+
     def task_finished(
         self, step_name, flow, graph, is_task_ok, retry_count, max_retries
     ):
@@ -437,9 +457,84 @@ class KubernetesDecorator(StepDecorator):
             # Best effort kill
             pass
 
+        if is_task_ok and len(getattr(flow, "_control_mapper_tasks", [])) > 1:
+            self._wait_for_mapper_tasks(flow, step_name)
+
+    def _wait_for_mapper_tasks(self, flow, step_name):
+        """
+        When launching multinode task with UBF, need to wait for the secondary
+        tasks to finish cleanly and produce their output before exiting the
+        main task. Otherwise, the main task finishing will cause secondary nodes
+        to terminate immediately, and possibly prematurely.
+        """
+        from metaflow import Step  # avoid circular dependency
+
+        TIMEOUT = 600
+        last_completion_timeout = time.time() + TIMEOUT
+        print("Waiting for batch secondary tasks to finish")
+        while last_completion_timeout > time.time():
+            time.sleep(2)
+            try:
+                step_path = "%s/%s/%s" % (flow.name, current.run_id, step_name)
+                tasks = [task for task in Step(step_path)]
+                if len(tasks) == len(flow._control_mapper_tasks):
+                    if all(
+                        task.finished_at is not None for task in tasks
+                    ):  # for some reason task.finished fails
+                        return True
+                else:
+                    print(
+                        "Waiting for all parallel tasks to finish. Finished: {}/{}".format(
+                            len(tasks),
+                            len(flow._control_mapper_tasks),
+                        )
+                    )
+            except Exception as e:
+                pass
+        raise Exception(
+            "Batch secondary workers did not finish in %s seconds" % TIMEOUT
+        )
+
     @classmethod
     def _save_package_once(cls, flow_datastore, package):
         if cls.package_url is None:
             cls.package_url, cls.package_sha = flow_datastore.save_data(
                 [package.blob], len_hint=1
             )[0]
+
+
+def validate_kube_labels_or_annotations(
+    labels: Optional[Dict[str, Optional[str]]],
+) -> bool:
+    """Validate label values.
+
+    This validates the kubernetes label values.  It does not validate the keys.
+    Ideally, keys should be static and also the validation rules for keys are
+    more complex than those for values.  For full validation rules, see:
+
+    https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set
+    """
+
+    def validate_label(s: Optional[str]):
+        regex_match = r"^(([A-Za-z0-9][-A-Za-z0-9_.]{0,61})?[A-Za-z0-9])?$"
+        if not s:
+            # allow empty label
+            return True
+        if not re.search(regex_match, s):
+            raise KubernetesException(
+                'Invalid value: "%s"\n'
+                "A valid label must be an empty string or one that\n"
+                "  - Consist of alphanumeric, '-', '_' or '.' characters\n"
+                "  - Begins and ends with an alphanumeric character\n"
+                "  - Is at most 63 characters" % s
+            )
+        return True
+
+    return all([validate_label(v) for v in labels.values()]) if labels else True
+
+
+def _setup_multinode_environment():
+    import socket
+    os.environ["MF_PARALLEL_MAIN_IP"] = socket.gethostbyname(os.environ["MASTER_ADDR"])
+    os.environ["MF_PARALLEL_NUM_NODES"] = os.environ["WORLD_SIZE"]
+    os.environ["MF_PARALLEL_NODE_INDEX"] = os.environ["RANK"]
