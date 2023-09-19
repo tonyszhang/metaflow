@@ -107,6 +107,25 @@ def kubernetes():
     type=JSONTypeClass(),
     multiple=False,
 )
+@click.option(
+    "--labels",
+    default=None,
+    type=JSONTypeClass(),
+    multiple=False,
+)
+@click.option(
+    "--annotations",
+    default=None,
+    type=JSONTypeClass(),
+    multiple=False,
+)
+@click.option("--ubf-context", default=None, type=click.Choice([None, "ubf_control"]))
+@click.option(
+    "--num-parallel",
+    default=0,
+    type=int,
+    help="Number of parallel nodes to run as a multi-node job.",
+)
 @click.pass_context
 def step(
     ctx,
@@ -132,6 +151,9 @@ def step(
     run_time_limit=None,
     persistent_volume_claims=None,
     tolerations=None,
+    labels=None,
+    annotations=None,
+    num_parallel=None,
     **kwargs
 ):
     def echo(msg, stream="stderr", job_id=None, **kwargs):
@@ -177,11 +199,17 @@ def step(
         )
         time.sleep(minutes_between_retries * 60)
 
+    step_args = " ".join(util.dict_to_cli_options(kwargs))
+    num_parallel = num_parallel or 0
+    if num_parallel and num_parallel > 1:
+        # For multinode, we need to add a placeholder that can be mutated by the caller
+        step_args += " [multinode-args]"
+
     step_cli = "{entrypoint} {top_args} step {step} {step_args}".format(
         entrypoint="%s -u %s" % (executable, os.path.basename(sys.argv[0])),
         top_args=" ".join(util.dict_to_cli_options(ctx.parent.parent.params)),
         step=step_name,
-        step_args=" ".join(util.dict_to_cli_options(kwargs)),
+        step_args=step_args,
     )
 
     # Set log tailing.
@@ -206,6 +234,8 @@ def step(
                     kwargs["run_id"], step_name, kwargs["task_id"]
                 ),
             )
+
+    attrs = {"metaflow.task_id": kwargs["task_id"]}
 
     try:
         kubernetes = Kubernetes(
@@ -245,6 +275,10 @@ def step(
                 env=env,
                 persistent_volume_claims=persistent_volume_claims,
                 tolerations=tolerations,
+                labels=labels,
+                annotations=annotations,
+                num_parallel=num_parallel, 
+                attrs=attrs,
             )
     except Exception as e:
         traceback.print_exc(chain=False)
