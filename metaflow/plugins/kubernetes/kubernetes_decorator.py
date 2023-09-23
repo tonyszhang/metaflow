@@ -211,11 +211,6 @@ class KubernetesDecorator(StepDecorator):
                 "Kubernetes. Please use one or the other.".format(step=step)
             )
 
-        # account for control task and increment rank of all other tasks
-        if any(getattr(deco, "IS_PARALLEL", False) for deco in decos) and not ubf_context == UBF_CONTROL:
-            worker_job_rank = int(os.environ["RANK"])
-            os.environ["RANK"] = str(worker_job_rank + 1)
-
         # Set run time limit for the Kubernetes job.
         self.run_time_limit = get_run_time_limit_for_task(decos)
         if self.run_time_limit < 60:
@@ -414,18 +409,28 @@ class KubernetesDecorator(StepDecorator):
             self._save_logs_sidecar.start()
 
         num_parallel = int(os.environ.get("WORLD_SIZE", 0))
-        if num_parallel >= 1 and ubf_context == UBF_CONTROL:
-            control_task_id = current.task_id
-            top_task_id = control_task_id.replace("control-", "")
-            mapper_task_ids = [control_task_id] + [
-                "%s-node-%d" % (top_task_id, node_idx)
-                for node_idx in range(1, num_parallel)
-            ]
-            flow._control_mapper_tasks = [
-                "%s/%s/%s" % (run_id, step_name, mapper_task_id)
-                for mapper_task_id in mapper_task_ids
-            ]
-            flow._control_task_is_mapper_zero = True
+        if num_parallel >= 1:
+
+            if ubf_context == UBF_CONTROL:
+                control_task_id = current.task_id
+                top_task_id = control_task_id.replace("control-", "")
+                mapper_task_ids = [control_task_id] + [
+                    "%s-node-%d" % (top_task_id, node_idx)
+                    for node_idx in range(1, num_parallel)
+                ]
+                flow._control_mapper_tasks = [
+                    "%s/%s/%s" % (run_id, step_name, mapper_task_id)
+                    for mapper_task_id in mapper_task_ids
+                ]
+                flow._control_task_is_mapper_zero = True
+
+            else:
+                # update rank on worker tasks.
+                # the default "RANK" is set using the indexed job id.
+                # since we use a separate replicated job for control task,
+                # we bump all worker tasks by 1
+                worker_job_rank = int(os.environ["RANK"])
+                os.environ["RANK"] = str(worker_job_rank + 1)
 
         if num_parallel >= 1:
             _setup_multinode_environment()
