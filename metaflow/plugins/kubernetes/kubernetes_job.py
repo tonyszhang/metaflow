@@ -82,7 +82,9 @@ class KubernetesJob(object):
         main_pod_index = 0
         subdomain = jobset_name
         coreweave_gpu = False # TODO: make this configurable
-        port = 3389 # TODO: make this configurable
+        # gpu_types = self._kwargs['gpu_type'] # https://docs.coreweave.com/coreweave-kubernetes/node-types
+        master_port = 3389 # int(self._kwargs['master_port']) if self._kwargs['master_port'] else None
+
         fqdn_suffix = "%s.svc.cluster.local" % self._kwargs["namespace"]
         jobset_main_addr = "%s-%s-%s-%s.%s.%s" % (
             jobset_name,
@@ -97,6 +99,9 @@ class KubernetesJob(object):
             repo_url="https://github.com/kubernetes-sigs/jobset",
             python_sdk_path="jobset/sdk/python",
         ):
+
+            # TODO (Eddie): Remove this and suggest to user.
+
             import subprocess
             import tempfile
             import shutil
@@ -148,8 +153,9 @@ class KubernetesJob(object):
                                     client.V1Container(
                                         command=command,
                                         ports=[
-                                            client.V1ContainerPort(container_port=port)
-                                        ],
+                                            client.V1ContainerPort(container_port=master_port)
+                                        ]
+                                        if master_port and job_name=="control" else [],
                                         env=[
                                             client.V1EnvVar(name=k, value=str(v))
                                             for k, v in self._kwargs.get(
@@ -181,7 +187,7 @@ class KubernetesJob(object):
                                             ),
                                             client.V1EnvVar(
                                                 name="MASTER_PORT",
-                                                value=str(port),
+                                                value=str(master_port),
                                             ),
                                             client.V1EnvVar(
                                                 name="RANK",
@@ -286,6 +292,11 @@ class KubernetesJob(object):
                                 else None,
                                 node_selector=self._kwargs.get("node_selector"),
                                 restart_policy="Never",
+
+                                # set_hostname_as_fqdn=True if is_mpi else None,
+                                # share_process_namespace=False if is_mpi else None,
+                                # subdomain=subdomain if is_mpi else None,
+
                                 service_account_name=self._kwargs["service_account"],
                                 termination_grace_period_seconds=0,
                                 tolerations=[
@@ -584,7 +595,7 @@ class KubernetesJob(object):
                 return RunningJob(
                     client=self._client,
                     name=job_name,
-                    uid=fake_id,  # this is never used.
+                    uid=fake_id, 
                     namespace=response["metadata"]["namespace"],
                 )
 

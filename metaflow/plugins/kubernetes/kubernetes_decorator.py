@@ -237,7 +237,7 @@ class KubernetesDecorator(StepDecorator):
                             self.attributes[k] = str(
                                 max(float(my_val or 0), float(v or 0))
                             )
-
+            
         # Check GPU vendor.
         if self.attributes["gpu_vendor"].lower() not in ("amd", "nvidia"):
             raise KubernetesException(
