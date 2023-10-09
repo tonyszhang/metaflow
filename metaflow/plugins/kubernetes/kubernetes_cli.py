@@ -235,7 +235,10 @@ def step(
                 ),
             )
 
-    attrs = {"metaflow.task_id": kwargs["task_id"]}
+    attrs = {
+        "metaflow.task_id": kwargs["task_id"],
+        "requires_passwordless_ssh": any([getattr(deco, "requires_passwordless_ssh", False) for deco in node.decorators]),
+    }
 
     try:
         kubernetes = Kubernetes(

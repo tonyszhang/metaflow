@@ -84,8 +84,17 @@ class KubernetesJob(object):
         main_job_index = 0
         main_pod_index = 0
         subdomain = jobset_name
-        coreweave_gpu = False # TODO: make this configurable
-        port = 3389 # TODO: make this configurable
+        coreweave_gpu = True # TODO: make this configurable
+        gpu_types = ['A40', 'RTX_A6000']  # self._kwargs['gpu_type'] # https://docs.coreweave.com/coreweave-kubernetes/node-types
+        master_port = 3389 # int(self._kwargs['master_port']) if self._kwargs['master_port'] else None
+
+        passwordless_ssh = True
+        if passwordless_ssh:
+            passwordless_ssh_service_name = subdomain
+            passwordless_ssh_service_selector = {
+                "passwordless-ssh-jobset": "true"
+            }
+
         fqdn_suffix = "%s.svc.cluster.local" % self._kwargs["namespace"]
         jobset_main_addr = "%s-%s-%s-%s.%s.%s" % (
             jobset_name,
@@ -100,6 +109,9 @@ class KubernetesJob(object):
             repo_url="https://github.com/kubernetes-sigs/jobset",
             python_sdk_path="jobset/sdk/python",
         ):
+
+            # TODO (Eddie): Remove this and suggest to user.
+
             import subprocess
             import tempfile
             import shutil
@@ -120,7 +132,36 @@ class KubernetesJob(object):
                 os.chdir(cwd)
                 shutil.rmtree(tmp_dir)
 
+        def _get_passwordless_ssh_service():
+
+            return client.V1Service(
+                api_version="v1",
+                kind="Service",
+                metadata=client.V1ObjectMeta(
+                    name=passwordless_ssh_service_name,
+                    namespace=self._kwargs["namespace"]
+                ),
+                spec=client.V1ServiceSpec(
+                    cluster_ip="None",
+                    internal_traffic_policy="Cluster",
+                    ip_families=["IPv4"],
+                    ip_family_policy="SingleStack",
+                    selector=passwordless_ssh_service_selector,
+                    session_affinity="None",
+                    type="ClusterIP",
+                    ports=[
+                        client.V1ServicePort(
+                            name="control",
+                            port=22,
+                            protocol="TCP",
+                            target_port=22
+                        )
+                    ]
+                )
+            )
+
         def _get_replicated_job(job_name, parallelism, command):
+
             return jobset.models.jobset_v1alpha2_replicated_job.JobsetV1alpha2ReplicatedJob(
                 name=job_name,
                 template=client.V1JobTemplateSpec(
@@ -140,7 +181,11 @@ class KubernetesJob(object):
                         template=client.V1PodTemplateSpec(
                             metadata=client.V1ObjectMeta(
                                 annotations=self._kwargs.get("annotations", {}),
-                                labels=self._kwargs.get("labels", {}),
+                                labels={
+                                    **self._kwargs.get("labels", {}),
+                                    **passwordless_ssh_service_selector, # TODO: necessary?
+                                    # TODO: cluster-name, app.kubernetes.io/name necessary?
+                                },
                                 namespace=self._kwargs["namespace"],
                             ),
                             spec=client.V1PodSpec(
@@ -151,8 +196,9 @@ class KubernetesJob(object):
                                     client.V1Container(
                                         command=command,
                                         ports=[
-                                            client.V1ContainerPort(container_port=port)
-                                        ],
+                                            client.V1ContainerPort(container_port=master_port)
+                                        ]
+                                        if master_port and job_name=="control" else [],
                                         env=[
                                             client.V1EnvVar(name=k, value=str(v))
                                             for k, v in self._kwargs.get(
@@ -184,7 +230,7 @@ class KubernetesJob(object):
                                             ),
                                             client.V1EnvVar(
                                                 name="MASTER_PORT",
-                                                value=str(port),
+                                                value=str(master_port),
                                             ),
                                             client.V1EnvVar(
                                                 name="RANK",
@@ -289,6 +335,11 @@ class KubernetesJob(object):
                                 else None,
                                 node_selector=self._kwargs.get("node_selector"),
                                 restart_policy="Never",
+
+                                set_hostname_as_fqdn=True, # configure pod hostname as pod's FQDN
+                                share_process_namespace=False, # default
+                                subdomain=subdomain, # FQDN = <hostname>.<subdomain>.<pod namespace>.svc.<cluster domain>
+
                                 service_account_name=self._kwargs["service_account"],
                                 termination_grace_period_seconds=0,
                                 tolerations=[
@@ -359,6 +410,18 @@ class KubernetesJob(object):
                 task_id.replace("control-", "") + "-node-`expr $RANK + 1`",
             )
 
+            if passwordless_ssh:
+
+                if not os.path.exists("/usr/sbin/sshd"):
+                    raise KubernetesJobException(
+                        "This @parallel decorator requires sshd to be installed in the container image." 
+                        "Please install OpenSSH."
+                    )
+
+                # run sshd in background
+                main_commands[-1] = "/usr/sbin/sshd -D & %s" % main_commands[-1] 
+                secondary_commands[-1] = "/usr/sbin/sshd -D & %s" % secondary_commands[-1]
+
             self._jobset = jobset.models.jobset_v1alpha2_job_set.JobsetV1alpha2JobSet(
                 api_version="jobset.x-k8s.io/v1alpha2",
                 kind="JobSet",
@@ -370,7 +433,8 @@ class KubernetesJob(object):
                 ),
                 spec=jobset.models.jobset_v1alpha2_job_set_spec.JobsetV1alpha2JobSetSpec(
                     network=jobset.models.jobset_v1alpha2_network.JobsetV1alpha2Network(
-                        enable_dns_hostnames=True, subdomain=subdomain
+                        enable_dns_hostnames=True if not self._kwargs['attrs']['requires_passwordless_ssh'] else False, 
+                        subdomain=subdomain
                     ),
                     replicated_jobs=[
                         _get_replicated_job("control", 1, main_commands),
@@ -382,6 +446,8 @@ class KubernetesJob(object):
                     ],
                 ),
             )
+
+            self._passwordless_ssh_service = _get_passwordless_ssh_service()
 
         else:
             self._job = client.V1Job(
@@ -573,6 +639,12 @@ class KubernetesJob(object):
             #       Hopefully, we will be able to get creative with kube-batch
 
             if "num_parallel" in self._kwargs and self._kwargs["num_parallel"] >= 1:
+
+                # TODO (Eddie): this is kinda gross. fix it.
+                if self._kwargs["attrs"]["requires_passwordless_ssh"]:
+                    api_instance = client.CoreV1Api()
+                    api_response = api_instance.create_namespaced_service(namespace=self._kwargs['namespace'], body=self._passwordless_ssh_service)
+
                 with client.ApiClient() as api_client:
                     api_instance = client.CustomObjectsApi(api_client)
 
@@ -591,7 +663,7 @@ class KubernetesJob(object):
                 return RunningJob(
                     client=self._client,
                     name=job_name,
-                    uid=fake_id,  # this is never used.
+                    uid=fake_id, 
                     namespace=response["metadata"]["namespace"],
                 )
 
