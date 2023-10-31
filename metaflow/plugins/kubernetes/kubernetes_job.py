@@ -85,7 +85,7 @@ class KubernetesJob(object):
         main_pod_index = 0
         subdomain = jobset_name
         coreweave_gpu = True # TODO: make this configurable
-        gpu_types = ['RTX_A6000', 'Tesla_V100_NVLINK']  # self._kwargs['gpu_type'] # https://docs.coreweave.com/coreweave-kubernetes/node-types
+        gpu_types = ['Tesla_V100_NVLINK']  # self._kwargs['gpu_type'] # https://docs.coreweave.com/coreweave-kubernetes/node-types
         master_port = 3389 # int(self._kwargs['master_port']) if self._kwargs['master_port'] else None
 
         passwordless_ssh = self._kwargs["attrs"]["requires_passwordless_ssh"]
