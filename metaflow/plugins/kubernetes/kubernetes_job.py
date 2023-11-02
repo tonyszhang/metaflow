@@ -84,13 +84,13 @@ class KubernetesJob(object):
         main_job_index = 0
         main_pod_index = 0
         subdomain = jobset_name
-        coreweave_gpu = True # TODO: make this configurable
-        gpu_types = ['Tesla_V100_NVLINK']  # self._kwargs['gpu_type'] # https://docs.coreweave.com/coreweave-kubernetes/node-types
+        # coreweave_gpu = True # TODO: make this configurable
+        # gpu_types = ['Tesla_V100_NVLINK']  # self._kwargs['gpu_type'] # https://docs.coreweave.com/coreweave-kubernetes/node-types
         master_port = 3389 # int(self._kwargs['master_port']) if self._kwargs['master_port'] else None
 
         passwordless_ssh = self._kwargs["attrs"]["requires_passwordless_ssh"]
         if passwordless_ssh:
-            passwordless_ssh_service_name = subdomain
+            passwordless_ssh_service_name = subdomain # TODO: should this be fixed?
             passwordless_ssh_service_selector = {
                 "passwordless-ssh-jobset": "true"
             }
@@ -113,7 +113,7 @@ class KubernetesJob(object):
             python_sdk_path="jobset/sdk/python",
         ):
 
-            # TODO (Eddie): Remove this and suggest to user.
+            # TODO (Eddie): Remove this and suggest something to user?
 
             import subprocess
             import tempfile
@@ -317,24 +317,24 @@ class KubernetesJob(object):
                                         ),
                                     )
                                 ],
-                                affinity=client.V1Affinity(
-                                    node_affinity=client.V1NodeAffinity(
-                                        required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
-                                            node_selector_terms=[
-                                                client.V1NodeSelectorTerm(
-                                                    match_expressions=[
-                                                        client.V1NodeSelectorRequirement(
-                                                            key="gpu.nvidia.com/class",
-                                                            operator="In",
-                                                            values=gpu_types,
-                                                        ),
-                                                    ]
-                                                ),
-                                            ]
-                                        )
-                                    )
-                                )
-                                if coreweave_gpu
+                                # affinity=client.V1Affinity(
+                                #     node_affinity=client.V1NodeAffinity(
+                                #         required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
+                                #             node_selector_terms=[
+                                #                 client.V1NodeSelectorTerm(
+                                #                     match_expressions=[
+                                #                         client.V1NodeSelectorRequirement(
+                                #                             key="gpu.nvidia.com/class",
+                                #                             operator="In",
+                                #                             values=gpu_types,
+                                #                         ),
+                                #                     ]
+                                #                 ),
+                                #             ]
+                                #         )
+                                #     )
+                                # )
+                                # if coreweave_gpu
                                 else None,
                                 node_selector=self._kwargs.get("node_selector"),
                                 restart_policy="Never",
